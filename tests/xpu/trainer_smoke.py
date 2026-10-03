@@ -5,6 +5,7 @@ import importlib
 import io
 import math
 import os
+import socket
 from contextlib import redirect_stdout
 from pathlib import Path
 
@@ -80,6 +81,7 @@ def main():
         local = next((int(os.environ[name]) for name in
                       ["MPI_LOCALRANKID", "SLURM_LOCALID", "LOCAL_RANK", "PALS_LOCAL_RANKID"]
                       if name in os.environ), 0)
+    print(f"rank={rank} local={local}: initializing distributed runtime", flush=True)
     local, rank, world, index = init_distributed_runtime(local, rank, world)
     device = select_device(local)
     assert device.type == args.expect_device, (device, args.expect_device)
@@ -87,6 +89,15 @@ def main():
     if device.type != "cpu":
         assert getattr(torch, device.type).current_device() == index
     print(f"rank={rank} local={local} device={device} backend={dist.get_backend()}", flush=True)
+    if device.type == "xpu":
+        properties = torch.xpu.get_device_properties(device)
+        assignment = dict(host=socket.gethostname(), rank=rank, local_rank=local,
+                          index=device.index, uuid=str(properties.uuid),
+                          mask=os.environ.get("ZE_AFFINITY_MASK"))
+        print(f"XPU assignment: {assignment}; properties={properties}", flush=True)
+        assignments = [None] * world
+        dist.all_gather_object(assignments, assignment)
+        assert len({(item["host"], item["uuid"]) for item in assignments}) == world, assignments
     # Exercise entry-point and throughput object collectives on this group.
     objects = [{"seed": 42, "models": [args.model_type]}] if rank == 0 else [None]
     dist.broadcast_object_list(objects, src=0)

@@ -8,7 +8,7 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and
 
 ### Added
 
-- Added experimental Intel XPU device selection and native XCCL runtime wiring for OPF training/evaluation, with CPU numerical and distributed regression coverage. XPU hardware qualification remains pending; see the Aurora HPC guide.
+- Added experimental Intel XPU device selection and native XCCL runtime wiring for OPF training/evaluation. Aurora checks demonstrated training on one, two and twelve XPU tiles, checkpoint/evaluation round trips and bounded case14 data runs. Real-data AdamW parameter parity, multi-node and CUDA/HIP hardware qualification remain pending; see the Aurora HPC guide and `tests/xpu/QUALIFICATION.md`.
 - Added smoke tests for Frontier preprocessing helpers in `scripts/data_process_frontier.py` (list parsing and SLURM rank/size env resolution).
 
 ### Changed

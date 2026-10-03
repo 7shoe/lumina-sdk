@@ -1,6 +1,6 @@
 # HPC Training
 
-This guide covers HPC launchers and the pending Aurora XPU qualification workflow.
+This guide covers HPC launchers and the Aurora XPU qualification workflow.
 
 !!! note "Substitute the UPPERCASE placeholders for your environment"
     The job scripts below contain `<UPPERCASE>` placeholders that you must replace before submitting:
@@ -177,26 +177,38 @@ export LUMINA_LOGGING_DIR=<LOG_DIR>
 export LUMINA_CHECKPOINT_DIR=<CKPT_DIR>
 ```
 
-## Aurora (ALCF): XPU qualification pending
+## Aurora (ALCF): demonstrated single-node XPU execution
 
 OPF training and evaluation automatically select CUDA, then XPU, then CPU.
 Distributed execution selects NCCL, native XCCL, or Gloo respectively, after
 binding the local device. A build without native XCCL raises for XPU DDP;
 single-device XPU selection does not require XCCL. There is no legacy CCL fallback.
 
-**Demonstrated coverage (2026-10-03):** the CPU numerical matrix for SAGE/GAT/RGAT,
-including GAT edge features, both scaling settings, five losses and Adam/AdamW;
-CPU bound evaluation; and all 16 one-/two-rank Gloo HGT/RGAT trainer configurations
-(single/multicase, scaling on/off). Trainer checks include distinct rank batches,
-synchronized gradients/parameters, timed validation, checkpoint loading, public
-prediction/aggregate evaluation, and optimizer continuation. These ran with site
-PyTorch `2.13.0a0+gitcf30153`, PyG `2.8.0.post1`, and NumPy `2.3.5`.
+**Demonstrated coverage (2026-10-03):** CPU/XPU synthetic numerical checks for
+SAGE/GAT/RGAT, including GAT edge features, both scaling settings, five losses and
+Adam/AdamW; CPU/XPU bound evaluation; all eight one-XPU and eight two-XPU HGT/RGAT
+trainer configurations (single/multicase, scaling on/off); four twelve-tile trainer
+jobs with scaling enabled; and two jobs with distinct per-rank masks. Native XCCL
+checks include distinct physical tile UUIDs, synchronized gradients/parameters,
+timed validation, checkpoint loading, public prediction/aggregate evaluation,
+optimizer continuation and normal teardown. Actual case14 smoke training passed
+on one/two XPUs, together with all three evaluation entry points for HGT/RGAT
+checkpoints. Site PyTorch `2.13.0a0+gitcf30153`, PyG `2.8.0.post1`, and NumPy `2.3.5`
+were preserved. Earlier CPU validation also covered all sixteen one-/two-rank
+Gloo trainer configurations.
 
-**Not yet qualified:** real XPU execution, XCCL collectives, node-level/multi-node
-runs, actual processed/on-disk/sharded data, and CUDA/HIP regression for this change.
-CPU results and skipped XPU tests do not establish XPU support. HEAT, homogeneous
-models, other dtypes, and production-sized configurations need their own qualification.
-RGAT's existing implementation does not configure edge-feature attention.
+**Qualification is partial:** the final combined regression suite had **246
+passes and one failure**, with no skips. The failure is actual-data RGAT AdamW
+CPU/XPU parameter/update drift; output and gradient comparisons remain close.
+Synthetic AdamW attention comparisons use a diagnosed absolute parameter/update
+budget of `1e-4` at learning rate `1e-3`. See `tests/xpu/QUALIFICATION.md` in the
+repository for thresholds, commands, failures and exact demonstrated scope.
+
+**Not yet qualified:** multi-node execution, on-disk/sharded data, CUDA/HIP
+hardware regression, HEAT/homogeneous models, other precisions and production-sized
+configurations. Actual-data checks used a small model and bounded training samples;
+they do not establish convergence or performance. RGAT's existing implementation
+does not configure edge-feature attention.
 
 Use the site `frameworks/2026.1.0` module and a virtual environment inheriting its
 PyTorch installation. Review a constrained pip dry run before installing
