@@ -1384,7 +1384,7 @@ class BaseOPFTrainer:
         """
         if self.model_type in HETERO_MODEL_TYPES:
             x_dict = {k: v.float() for k, v in batch.x_dict.items()}
-            return self.model.module(x_dict, batch.edge_index_dict, minmax_scaling=self.minmax_scaling)
+            return self.model(x_dict, batch.edge_index_dict, minmax_scaling=self.minmax_scaling)
         if isinstance(batch, torch.Tensor) or hasattr(batch, "node_type"):
             homo_batch = batch
         else:
@@ -1396,7 +1396,7 @@ class BaseOPFTrainer:
         if hasattr(homo_batch, "edge_attr") and homo_batch.edge_attr is not None:
             homo_batch.edge_attr = homo_batch.edge_attr.float()
 
-        homo_output = self.model.module(homo_batch)
+        homo_output = self.model(homo_batch)
 
         predictions = {}
         node_types = ["bus", "generator", "load", "shunt"]
@@ -1689,7 +1689,6 @@ class OPFTrainer(BaseOPFTrainer):
         self.loss_manager = OPFLossManager(
             loss_type=self.loss_type,
             device=self.device,
-            log_normalized_violation=self.log_normalized_violation,
         )
 
         if self.global_rank == 0:
@@ -2335,7 +2334,6 @@ class MultiCaseOPFTrainer(BaseOPFTrainer):
             self.loss_managers[case_idx] = OPFLossManager(
                 loss_type=self.loss_type,
                 device=self.device,
-                log_normalized_violation=self.log_normalized_violation,
             )
 
         if self.global_rank == 0:

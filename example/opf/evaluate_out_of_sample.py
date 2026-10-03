@@ -791,7 +791,7 @@ def main():
         try:
             checkpoint = torch.load(args.checkpoint_file, map_location='cpu')
             model_class = checkpoint.get('model_class', '')
-            if any(h in model_class for h in ['GAT', 'GCN', 'GIN', 'Transformer', 'TRANSFORMER']):
+            if model_class.rsplit('.', 1)[-1] in ['GAT', 'GCN', 'GIN', 'Transformer', 'TRANSFORMER']:
                 homogeneous = True
                 print(f"Detected homogeneous model class: {model_class}")
         except Exception:
