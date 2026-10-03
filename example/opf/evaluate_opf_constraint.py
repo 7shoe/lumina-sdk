@@ -17,6 +17,7 @@ from lumina.evaluator.opf.utils import Modeler
 from lumina.loader.opf.opf_loader import DataLoader
 from lumina.model.opf.losses import OPFLossManager
 from lumina.trainer.opf.trainer import BaseOPFTrainer
+from lumina.trainer.opf.utils import select_device
 
 
 def main():
@@ -55,7 +56,7 @@ def main():
     )
     args = parser.parse_args()
 
-    device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+    device = select_device()
 
     print(f"Loading model from checkpoint: {args.checkpoint}")
     modeler = Modeler(

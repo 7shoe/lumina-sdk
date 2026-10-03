@@ -48,7 +48,7 @@ from lumina.trainer.opf.utils import (
     HETERO_MODEL_TYPES,
     build_hetero_model_spec,
     initialize_model,
-    select_cuda_device_index,
+    select_device,
 )
 from lumina.utils.graph_utils import HomoOPFDataset, convert_opf_to_homo
 from lumina.utils.throughput import ThroughputTracker
@@ -156,14 +156,8 @@ class BaseOPFTrainer:
         self.local_rank = local_rank
         self.global_rank = global_rank
         self.world_size = world_size
-        if torch.cuda.is_available():
-            visible_devices = torch.cuda.device_count()
-            self.device_index = select_cuda_device_index(local_rank, visible_devices)
-            self.device = torch.device(f"cuda:{self.device_index}")
-            torch.cuda.set_device(self.device_index)
-        else:
-            self.device_index = 0
-            self.device = torch.device("cpu")
+        self.device = select_device(local_rank)
+        self.device_index = self.device.index if self.device.index is not None else 0
         self.wandb_run_name = wandb_run_name
         self.wandb_group_name = wandb_group_name
         self.wandb_requested = wandb_requested
@@ -789,7 +783,7 @@ class BaseOPFTrainer:
         ddp_kwargs = {
             "find_unused_parameters": True,
         }
-        if self.device.type == "cuda":
+        if self.device.type in {"cuda", "xpu"}:
             ddp_kwargs["device_ids"] = [self.device_index]
         model = DDP(model, **ddp_kwargs)
         return model
@@ -1084,7 +1078,8 @@ class BaseOPFTrainer:
     def _sync_for_timing(self):
         if self.device.type == "cuda":
             torch.cuda.synchronize(self.device)
-        elif hasattr(torch, "accelerator") and hasattr(torch.accelerator, "synchronize"):
+        elif (self.device.type != "cpu" and hasattr(torch, "accelerator")
+              and hasattr(torch.accelerator, "synchronize")):
             torch.accelerator.synchronize()
 
     def _should_time_validation_batch(self, batch_idx, timed_batches):
@@ -1840,7 +1835,11 @@ class OPFTrainer(BaseOPFTrainer):
         avg_task_loss = total_task_loss / num_batches
 
         loss_tensor = torch.tensor([avg_loss, avg_task_loss], device=self.device)
-        dist.all_reduce(loss_tensor, op=dist.ReduceOp.AVG)
+        if dist.get_backend() == "nccl":
+            dist.all_reduce(loss_tensor, op=dist.ReduceOp.AVG)
+        else:
+            dist.all_reduce(loss_tensor, op=dist.ReduceOp.SUM)
+            loss_tensor.div_(dist.get_world_size())
 
         metric_sums, metric_counts = self._reduce_metrics(metric_sums, metric_counts)
         metric_avgs = self._compute_metric_avgs(metric_sums, metric_counts)
@@ -2589,7 +2588,11 @@ class MultiCaseOPFTrainer(BaseOPFTrainer):
         avg_task_loss = total_task_loss / num_batches
 
         loss_tensor = torch.tensor([avg_loss, avg_task_loss], device=self.device)
-        dist.all_reduce(loss_tensor, op=dist.ReduceOp.AVG)
+        if dist.get_backend() == "nccl":
+            dist.all_reduce(loss_tensor, op=dist.ReduceOp.AVG)
+        else:
+            dist.all_reduce(loss_tensor, op=dist.ReduceOp.SUM)
+            loss_tensor.div_(dist.get_world_size())
 
         metric_sums, metric_counts = self._reduce_metrics(metric_sums, metric_counts)
         metric_avgs = self._compute_metric_avgs(metric_sums, metric_counts)
@@ -2717,7 +2720,11 @@ class MultiCaseOPFTrainer(BaseOPFTrainer):
         avg_task_loss = total_task_loss / num_batches
 
         loss_tensor = torch.tensor([avg_loss, avg_task_loss], device=self.device)
-        dist.all_reduce(loss_tensor, op=dist.ReduceOp.AVG)
+        if dist.get_backend() == "nccl":
+            dist.all_reduce(loss_tensor, op=dist.ReduceOp.AVG)
+        else:
+            dist.all_reduce(loss_tensor, op=dist.ReduceOp.SUM)
+            loss_tensor.div_(dist.get_world_size())
 
         metric_sums, metric_counts = self._reduce_metrics(metric_sums, metric_counts)
         metric_avgs = self._compute_metric_avgs(metric_sums, metric_counts)

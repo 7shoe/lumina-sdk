@@ -25,6 +25,7 @@ from lumina.dataset.opf.opf_dataset import OPFDataset, OPFHomogeneousDataset
 from lumina.model.opf.losses import OPFLossManager
 from lumina.evaluator.opf.utils import Modeler
 from lumina.loader.opf.opf_loader import DataLoader
+from lumina.trainer.opf.utils import select_device
 
 import pandapower as pp
 
@@ -141,7 +142,7 @@ Examples:
         '--device',
         type=str,
         default='auto',
-        choices=['auto', 'cuda', 'cpu'],
+        choices=['auto', 'cuda', 'xpu', 'cpu'],
         help='Device to use for inference (default: auto)'
     )
 
@@ -753,10 +754,7 @@ def save_results(results: List[dict], output_path: str):
 def main():
     args = parse_args()
 
-    if args.device == 'auto':
-        device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
-    else:
-        device = torch.device(args.device)
+    device = select_device(device=None if args.device == "auto" else args.device)
 
     print(f"Using device: {device}")
 

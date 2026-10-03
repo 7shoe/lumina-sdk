@@ -171,7 +171,7 @@ def init_ddp():
     world_size = MPI.COMM_WORLD.Get_size()
     global_rank = MPI.COMM_WORLD.Get_rank()
     local_rank = 0
-    local_rank_vars = ["MPI_LOCALRANKID", "SLURM_LOCALID", "LOCAL_RANK"] # Local rank environment variables for Polaris and Perlmutter
+    local_rank_vars = ["MPI_LOCALRANKID", "SLURM_LOCALID", "LOCAL_RANK", "PALS_LOCAL_RANKID"]
     for var in local_rank_vars:
         if var in os.environ:
             local_rank = int(os.environ[var])
@@ -181,7 +181,6 @@ def init_ddp():
         local_rank=local_rank,
         global_rank=global_rank,
         world_size=world_size,
-        backend="nccl",
     )
 
     return local_rank, global_rank, world_size

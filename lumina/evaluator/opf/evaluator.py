@@ -16,6 +16,8 @@ import torch.nn as nn
 import warnings
 from typing import Dict, List, Optional, Tuple, Union
 
+from lumina.utils.model import select_device
+
 
 class ACOPFConstraintEvaluator(nn.Module):
     """Comprehensive constraint violation evaluator for ACOPF problems.
@@ -72,7 +74,7 @@ class ACOPFConstraintEvaluator(nn.Module):
         """
         super().__init__()
 
-        self.device = device or torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+        self.device = device if device is not None else select_device()
         self.base_mva = base_mva
 
         # Store network parameters
@@ -484,7 +486,7 @@ if __name__ == "__main__":
     # Test the constraint evaluator
     print("Testing ACOPFConstraintEvaluator...")
 
-    device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+    device = select_device()
 
     # Create dummy test data
     batch_size = 32

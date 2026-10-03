@@ -18,7 +18,7 @@ import torch
 from tqdm import tqdm
 
 from lumina.evaluator.opf.evaluator import ACOPFConstraintEvaluator
-from lumina.trainer.opf.utils import build_hetero_model_spec, resolve_hetero_model_type
+from lumina.trainer.opf.utils import build_hetero_model_spec, resolve_hetero_model_type, select_device
 
 _LINE_CACHE = {}
 
@@ -35,7 +35,7 @@ def extract_network_parameters_from_batch(batch, device: torch.device = None) ->
         Dictionary containing extracted network parameters
     """
     if device is None:
-        device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+        device = select_device()
 
     extracted_data = {}
 
@@ -93,7 +93,7 @@ def extract_voltage_and_generation_limits_from_batch(batch, device: torch.device
         Tuple of (voltage_limits dict, generation_limits dict)
     """
     if device is None:
-        device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+        device = select_device()
 
     voltage_limits = {}
     generation_limits = {}
@@ -135,7 +135,7 @@ def extract_generation_costs_from_batch(batch, device: torch.device = None) -> O
         Tensor of generation cost coefficients or None
     """
     if device is None:
-        device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+        device = select_device()
 
     try:
         if 'generator' in batch.x_dict:

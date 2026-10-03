@@ -151,7 +151,9 @@ class ThroughputTracker:
 
     def accelerator_synchronize(self):
         """Synchronize the current accelerator device for accurate timing."""
-        if hasattr(torch, "accelerator") and hasattr(torch.accelerator, "synchronize"):
+        if (hasattr(torch, "accelerator")
+                and hasattr(torch.accelerator, "synchronize")
+                and torch.accelerator.is_available()):
             torch.accelerator.synchronize()
 
     def get_batch_samples(self, batch):

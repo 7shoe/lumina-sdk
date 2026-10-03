@@ -21,6 +21,7 @@ from lumina.dataset.opf.transforms import to_float32
 from lumina.loader.opf.opf_loader import DataLoader
 from lumina.model.opf.hetero_model import OPFHeteroGNN
 from lumina.model.opf.losses import OPFLossManager
+from lumina.trainer.opf.utils import select_device
 
 
 def parse_args():
@@ -36,7 +37,7 @@ def parse_args():
     parser.add_argument("--group_id", type=int, default=0,
                         help="Dataset group (each group ~ 15k samples).")
     parser.add_argument("--device", default=None,
-                        help="Override device (default: cuda if available else cpu).")
+                        help="Override device (default: CUDA, then XPU, then CPU).")
     return parser.parse_args()
 
 
@@ -51,9 +52,7 @@ def main():
     cfg = load_yaml(args.config)
     model_cfg = load_yaml(args.model_config)["models"]["HeteroGNN"]
 
-    device = torch.device(
-        args.device or ("cuda" if torch.cuda.is_available() else "cpu")
-    )
+    device = select_device(device=args.device)
     print(f"Using device: {device}")
 
     dataset = OPFDataset(

@@ -196,7 +196,6 @@ def init_ddp():
         local_rank=local_rank,
         global_rank=global_rank,
         world_size=world_size,
-        backend="nccl",
     )
 
     return local_rank, global_rank, world_size

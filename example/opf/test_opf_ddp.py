@@ -94,21 +94,18 @@ def build_parser():
 
 
 def init_ddp():
-    local_rank = int(os.environ.get("LOCAL_RANK", 0))
-    world_size = int(os.environ.get("WORLD_SIZE", 1))
-    global_rank = int(os.environ.get("RANK", 0))
+    from lumina.trainer.opf.utils import init_distributed_runtime
 
-    dist.init_process_group(
-        backend="nccl",
-        init_method="env://",
-        world_size=world_size,
-        rank=global_rank,
-        device_id=local_rank,
+    if "RANK" not in os.environ and "WORLD_SIZE" not in os.environ:
+        from train_opf_ddp import init_ddp as init_mpi_ddp
+        return init_mpi_ddp()
+    # Explicit env launch: require both global rank and size; torchrun supplies them.
+    local_rank = int(os.environ.get("LOCAL_RANK", os.environ.get("PALS_LOCAL_RANKID", 0)))
+    world_size = int(os.environ["WORLD_SIZE"])
+    global_rank = int(os.environ["RANK"])
+    local_rank, global_rank, world_size, _ = init_distributed_runtime(
+        local_rank, global_rank, world_size
     )
-
-    if torch.cuda.is_available():
-        torch.cuda.set_device(local_rank)
-
     return local_rank, global_rank, world_size
 
 
