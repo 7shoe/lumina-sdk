@@ -1,3 +1,4 @@
+import importlib
 import sys
 import types
 
@@ -9,6 +10,12 @@ from torch_geometric.data import HeteroData
 def _install_pandapower_stub():
     if "pandapower" in sys.modules:
         return
+    try:
+        importlib.import_module("pandapower")
+        return
+    except ModuleNotFoundError as exc:
+        if exc.name != "pandapower":
+            raise
     pp_module = types.ModuleType("pandapower")
     pp_module.converter = types.SimpleNamespace(from_mpc=lambda *args, **kwargs: None, pypower=types.SimpleNamespace(to_ppc=lambda *args, **kwargs: {}))
     sys.modules["pandapower"] = pp_module

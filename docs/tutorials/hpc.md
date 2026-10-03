@@ -1,6 +1,6 @@
 # HPC Training
 
-This guide covers running LUMINA on Argonne's Polaris and NERSC's Perlmutter supercomputers.
+This guide covers HPC launchers and the pending Aurora XPU qualification workflow.
 
 !!! note "Substitute the UPPERCASE placeholders for your environment"
     The job scripts below contain `<UPPERCASE>` placeholders that you must replace before submitting:
@@ -176,6 +176,113 @@ export LUMINA_ROOT=<DATA_ROOT>
 export LUMINA_LOGGING_DIR=<LOG_DIR>
 export LUMINA_CHECKPOINT_DIR=<CKPT_DIR>
 ```
+
+## Aurora (ALCF): XPU qualification pending
+
+OPF training and evaluation automatically select CUDA, then XPU, then CPU.
+Distributed execution selects NCCL, native XCCL, or Gloo respectively, after
+binding the local device. A build without native XCCL raises for XPU DDP;
+single-device XPU selection does not require XCCL. There is no legacy CCL fallback.
+
+**Demonstrated coverage (2026-10-03):** the CPU numerical matrix for SAGE/GAT/RGAT,
+including GAT edge features, both scaling settings, five losses and Adam/AdamW;
+CPU bound evaluation; and all 16 one-/two-rank Gloo HGT/RGAT trainer configurations
+(single/multicase, scaling on/off). Trainer checks include distinct rank batches,
+synchronized gradients/parameters, timed validation, checkpoint loading, public
+prediction/aggregate evaluation, and optimizer continuation. These ran with site
+PyTorch `2.13.0a0+gitcf30153`, PyG `2.8.0.post1`, and NumPy `2.3.5`.
+
+**Not yet qualified:** real XPU execution, XCCL collectives, node-level/multi-node
+runs, actual processed/on-disk/sharded data, and CUDA/HIP regression for this change.
+CPU results and skipped XPU tests do not establish XPU support. HEAT, homogeneous
+models, other dtypes, and production-sized configurations need their own qualification.
+RGAT's existing implementation does not configure edge-feature attention.
+
+Use the site `frameworks/2026.1.0` module and a virtual environment inheriting its
+PyTorch installation. Review a constrained pip dry run before installing
+`.[test,acopf]` and the existing evaluation dependencies `huggingface_hub` and
+`safetensors`. Preserve site PyTorch; omit IPEX, legacy CCL bindings, and optional
+PyG extensions for the initial baseline. Inspect inherited extensions too:
+
+```bash
+python -B - <<'PY'
+import importlib.util
+import inspect
+import socket
+import sys
+import torch
+import torch_geometric
+import numpy
+from torch_geometric import typing as flags
+from torch_geometric.nn.dense.linear import HeteroLinear, HeteroDictLinear
+
+print(socket.gethostname(), sys.executable)
+for module in [torch, torch_geometric, numpy]:
+    print(module.__name__, module.__version__, module.__file__)
+print("XPU count", torch.xpu.device_count(), "XCCL", torch.distributed.is_xccl_available())
+for name in ["pyg_lib", "torch_scatter", "torch_sparse", "torch_cluster", "torch_spline_conv"]:
+    spec = importlib.util.find_spec(name)
+    print(name, None if spec is None else spec.origin)
+    assert spec is None, "Use a clean site-compatible environment for the initial baseline"
+for name in ["WITH_PYG_LIB", "WITH_SEGMM", "WITH_GMM", "WITH_TORCH_SCATTER", "WITH_TORCH_SPARSE"]:
+    print(name, getattr(flags, name, False))
+    assert not getattr(flags, name, False)
+for cls in [HeteroLinear, HeteroDictLinear]:
+    print(inspect.getsource(cls.forward))
+assert torch.xpu.is_available() and torch.xpu.device_count() > 0
+assert torch.distributed.is_xccl_available()
+PY
+```
+
+Run that preflight inside the allocation; a login-node count of zero is insufficient.
+Do not patch PyG capability flags to bypass unsupported kernels.
+
+The main `example/opf/train_opf_ddp.py` launcher remains MPI-only. Local-rank
+precedence is `MPI_LOCALRANKID`, `SLURM_LOCALID`, `LOCAL_RANK`, then
+`PALS_LOCAL_RANKID`; clear stale values before launch. Distributed checkpoint
+evaluation (`test_opf_ddp.py`) uses MPI if both `RANK` and `WORLD_SIZE` are absent,
+and requires both for an explicit environment launch such as torchrun.
+`evaluate_out_of_sample.py` also accepts `--device xpu` or `--device cpu`.
+Modeler aggregate constraint postprocessing intentionally remains on CPU.
+
+!!! note "Substitute allocation and shared output paths"
+    Set `<COMPUTE_HOST>` to an allocated compute node, `<FREE_PORT>` to a shared
+    free port, and use distinct shared output directories for every smoke run.
+
+```bash
+export MASTER_ADDR=<COMPUTE_HOST>
+export MASTER_PORT=<FREE_PORT>
+unset RANK WORLD_SIZE LOCAL_RANK
+python -m pytest -q -s tests/xpu/test_numerics.py tests/xpu/test_evaluation.py
+timeout 300 mpiexec --pmi=pmix --envall -n 1 --ppn 1 \
+  python tests/xpu/trainer_smoke.py --expect-device xpu --output <SINGLE_XPU_OUTPUT>
+timeout 300 mpiexec --pmi=pmix --envall -n 2 --ppn 2 \
+  python tests/xpu/trainer_smoke.py --expect-device xpu --output <TWO_XPU_OUTPUT>
+```
+
+Repeat numerical execution; repeat trainer runs for `--model-type HGT` and `RGAT`,
+with `--multi`, and with/without `--no-minmax-scaling`. Progress from two devices
+to all process-visible tiles (the planned FLAT layout has twelve), then at least
+two nodes. Test full visibility and distinct rank-specific masks. Under a single
+device mask every local index is zero: record physical device identities to prove
+different ranks use different devices. Record rank/mask/hierarchy environment,
+module/driver versions, numerical errors, and complete job exit status.
+
+Set `LUMINA_XPU_DATA_ROOT` to a prestaged raw **and** processed case14 cache to run
+`test_processed_rgat_steps`; optionally set `LUMINA_XPU_MODEL_CONFIG` to the intended
+model YAML. A missing cache with the root set fails; an unset root skips and leaves
+qualification pending. Follow with actual-data simple/MPI training and all three
+evaluation entry points, requiring nonempty finite metrics and expected batch
+counts. Pass `--minmax_scaling` explicitly to the MPI training CLI. Qualify intended
+width/depth/heads, batch size and accumulation, then on-disk and balanced sharded data.
+
+Keep eager FP32 for initial qualification. A single-rank hang or teardown crash
+is an unsuccessful job; retain the last stage and external timeout result for site
+diagnosis. The smoke script's explicit `LUMINA_SKIP_XCCL_DESTROY=1` option is only
+for a reproduced XCCL teardown issue and must be recorded if used. Production
+teardown is unchanged; the workaround does not address an initialization/training hang.
+See the [ALCF PyTorch guide](https://docs.alcf.anl.gov/aurora/data-science/frameworks/pytorch/)
+and [known issues](https://docs.alcf.anl.gov/aurora/known-issues/) for site guidance.
 
 ## Existing HPC Documentation
 

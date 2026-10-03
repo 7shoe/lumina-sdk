@@ -8,6 +8,7 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and
 
 ### Added
 
+- Added experimental Intel XPU device selection and native XCCL runtime wiring for OPF training/evaluation, with CPU numerical and distributed regression coverage. XPU hardware qualification remains pending; see the Aurora HPC guide.
 - Added smoke tests for Frontier preprocessing helpers in `scripts/data_process_frontier.py` (list parsing and SLURM rank/size env resolution).
 
 ### Changed
@@ -15,6 +16,11 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and
 - Improved cross-platform DDP GPU binding so Perlmutter/Polaris use `LOCAL_RANK` when all GPUs are visible, while Frontier remains compatible with per-rank `ROCR_VISIBLE_DEVICES` launch wrappers.
 - Frontier training now supports runtime path overrides via CLI flags (`--root`, `--logging_dir`, `--checkpoint_dir`) or env vars (`LUMINA_ROOT`, `LUMINA_LOGGING_DIR`, `LUMINA_CHECKPOINT_DIR`), removing site-specific hardcoded paths from shipped configs.
 - Removed unreleased Lagrangian settings from Frontier-facing configs and removed Lagrangian loss options from the Frontier training CLI.
+
+### Fixed
+
+- Fixed unsupported OPF loss initialization arguments, forwards bypassing DDP, and RGAT checkpoint routing to homogeneous evaluation data.
+- Avoid accelerator synchronization during CPU validation timing or throughput measurement when no accelerator is available.
 
 ## [v0.1.0rc1] — 2026-04-30
 
