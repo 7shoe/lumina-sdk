@@ -10,6 +10,7 @@ SOURCE DETAILS:
 - REPO: https://github.com/argonne-gridfm/lumina-sdk
 - BRANCH: ed/frontier
 - FILE: ~/lumina/model/opf/augmented_lagrangian.py
+- Modified by Carlo Siebenschuh
 
 IMPL DETAILS: 
 - earlier variants deviated more severaly (no EWM, uncombined residuals, etc.)

@@ -357,9 +357,12 @@ class OPFLossManager(nn.Module):
 
     Args:
         loss_type (str): Type of loss to use. One of 'mse', 'rmse', 'mae',
-            'mape', or 'smooth_l1'.
+            'mape', 'smooth_l1', or 'augmented_lagrangian'. AL requires explicit
+            constraint initialization and a successful-optimizer-step hook.
         device (torch.device, optional): Device for computations.
             Defaults to CPU.
+        lagrangian_config (dict, optional): Validated upstream Frontier AL configuration.
+            Required for AL and rejected for supervised losses.
         **kwargs: Additional arguments forwarded to ``ACOPFLossFunction``
             (e.g. ``node_weights``, ``reduction``, ``epsilon``, ``beta``).
     """
@@ -368,13 +371,48 @@ class OPFLossManager(nn.Module):
         self,
         loss_type: str = 'mse',
         device: Optional[torch.device] = None,
+        lagrangian_config: Optional[Dict] = None,
         **kwargs
     ):
         super().__init__()
 
         self.loss_type = loss_type
         self.device = device or torch.device('cpu')
-        self.base_loss = ACOPFLossFunction(loss_type=loss_type, **kwargs)
+        self.lagrangian = None
+        if loss_type == 'augmented_lagrangian':
+            from .augmented_lagrangian import AugmentedLagrangianLoss
+            if kwargs.get('reduction', 'mean') != 'mean':
+                raise ValueError('AL requires supervised reduction=mean')
+            self.lagrangian = AugmentedLagrangianLoss(lagrangian_config)
+            self.base_loss = ACOPFLossFunction(loss_type='mse', **kwargs)
+        else:
+            if lagrangian_config is not None:
+                raise ValueError('lagrangian_config requires augmented_lagrangian')
+            self.base_loss = ACOPFLossFunction(loss_type=loss_type, **kwargs)
+
+    def initialize_constraints(self, graph, device=None, dtype=torch.float32):
+        if self.lagrangian is None:
+            raise ValueError('Constraint initialization requires AL')
+        self.lagrangian.initialize_constraints(graph, device=device or self.device, dtype=dtype)
+
+    def on_successful_step(self, observation, successful_steps):
+        if self.lagrangian is not None:
+            return self.lagrangian.on_successful_step(observation, successful_steps)
+        return False
+
+    def step_epoch(self):
+        if self.lagrangian is not None:
+            self.lagrangian.step_epoch()
+
+    def loss_state_dict(self):
+        return self.lagrangian.training_state_dict() if self.lagrangian is not None else None
+
+    def load_loss_state_dict(self, state):
+        if self.lagrangian is None:
+            if state is not None:
+                raise ValueError('Cannot load AL state into a supervised loss')
+        else:
+            self.lagrangian.load_state_dict(state)
 
     def compute_loss(
         self,
@@ -417,6 +455,12 @@ class OPFLossManager(nn.Module):
         results = self.base_loss(masked_predictions, masked_targets)
         loss = results['total_loss']
         results.setdefault('objective', loss)
+
+        if self.lagrangian is not None:
+            # Full predictions and original graph; supervision masks never delete physics.
+            loss, al_info = self.lagrangian(loss, predictions, batch)
+            results.update(al_info)
+            results['total_loss'] = loss
 
         if return_info:
             return loss, results
@@ -489,6 +533,10 @@ class OPFLossManager(nn.Module):
         }
         if hasattr(self.base_loss, 'get_loss_info'):
             info.update(self.base_loss.get_loss_info())
+        if self.lagrangian is not None:
+            # The supervised component reports MSE; retain the composite identity.
+            info['loss_type'] = self.loss_type
+            info['lagrangian'] = self.lagrangian.get_extra_state()['config']
         return info
 
 
