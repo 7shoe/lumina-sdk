@@ -1,0 +1,54 @@
+# Upstream Frontier AL policy; models/optimizer/evaluator retained for MSE comparison.
+# AL settings and five-MSE/two-penalty epochs from the pinned Frontier large recipe.
+case: case30
+groups: [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19]
+seed: 42
+split_seed: 42
+split: [0.8, 0.1, 0.1]
+limits: {train: 0, val: 0, test: 0}
+model_type: HGT
+loss_type: augmented_lagrangian
+evaluate_test: true
+lagrangian:
+  formula: upstream_frontier_al_physical_constraints_v1
+  mu_0: 0.003764222679882905
+  mu_increase_factor: 1.0
+  max_mu: 100.0
+  warmup_epochs: 2
+  ema_beta: 0.0
+  penalty_check_interval: 1
+  penalty_drop_ratio: 0.5
+  penalty_increase_factor: 1.5
+  multiplier_clip: 1000.0
+  multiplier_improve_ratio: 0.9
+  multiplier_check_interval: 1
+  multiplier_min_improve: 0.0
+  normalize_by_rms: false
+  normalize_by_size: true
+  verbose: false
+  units: opfdata_release1_pu_radians
+  zero_rating: unmonitored
+selection_mse: sdk_mse
+optimizer:
+  AdamW: {lr: 0.001, weight_decay: 0.0001, eps: 0.00000001}
+training:
+  loss_schedule:
+    enabled: true
+    initial_loss_type: mse
+    switch_loss_type: augmented_lagrangian
+    mse_epochs: 5
+  accumulate_grad_batches: 1
+  precision: fp32
+  amp: false
+  batch_size: 64
+  eval_batch_size: 128
+  max_samples: 2000000
+  max_steps: 0
+  validate_every_samples: 100000
+  checkpoint_samples: [600000, 1000000]
+  gradient_diagnostics_every_steps: 250
+  gradient_clip: 1.0
+models:
+  HGT: {hidden_channels: 128, num_layers: 3, num_heads: 4, dropout: 0.1}
+  RGAT: {hidden_channels: 128, num_layers: 3, num_heads: 4}
+  Transformer: {hidden_dim: 128, num_layers: 3, dropout: 0.1}
