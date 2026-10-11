@@ -1,0 +1,20 @@
+#!/usr/bin/env bash
+#PBS -N opf-cpu-pipeline
+#PBS -A EpiCalib
+#PBS -q debug
+#PBS -l select=2
+#PBS -l walltime=01:00:00
+#PBS -l filesystems=home:flare
+#PBS -j oe
+set -euo pipefail
+source /home/siebenschuh/Projects/reasonABLE/env/Aurora/activate_reason_venv.sh
+cd /home/siebenschuh/Projects/lumina-sdk
+export OMP_NUM_THREADS=1 MKL_NUM_THREADS=1 OPENBLAS_NUM_THREADS=1
+export PYTHONUNBUFFERED=1 ZE_FLAT_DEVICE_HIERARCHY=FLAT MPIR_CVAR_PROGRESS_TIMEOUT=0
+unset MPI4PY_RC_INITIALIZE RANK WORLD_SIZE LOCAL_RANK LOCAL_WORLD_SIZE MPI_LOCALRANKID SLURM_LOCALID PALS_LOCAL_RANKID
+report="distillation/solver/reports/sparse_pipeline/compute_${PBS_JOBID%%.*}"
+mkdir -p "$report/source"
+cp distillation/solver/sparse_solver/*.py tests/validate_sparse_solver.py tests/xpu/solver_pipeline.pbs "$report/source/"
+mpiexec --pmi=pmix --envall -n 2 --ppn 1 --cpu-bind depth --depth 48 \
+    python -u tests/validate_sparse_solver.py --compute-campaign --output "$report" \
+    --workers 1 4 8 16 32 --task-sizes 1 8 --requests 10 100 10000
