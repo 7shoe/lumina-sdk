@@ -1,0 +1,27 @@
+#!/usr/bin/env bash
+#PBS -N lumina-t1-data
+#PBS -A EpiCalib
+#PBS -q debug-scaling
+#PBS -l select=2
+#PBS -l walltime=01:00:00
+#PBS -l filesystems=home:flare
+#PBS -j oe
+set -euo pipefail
+
+repo=${T1_REPO:-/home/siebenschuh/Projects/lumina-sdk}
+source "${T1_ACTIVATE:-/home/siebenschuh/Projects/reasonABLE/env/Aurora/activate_reason_venv.sh}"
+cd "$repo"
+export OMP_NUM_THREADS=4 MKL_NUM_THREADS=4 PYTHONUNBUFFERED=1
+unset MPI4PY_RC_INITIALIZE RANK WORLD_SIZE LOCAL_RANK MPI_LOCALRANKID SLURM_LOCALID PALS_LOCAL_RANKID
+
+nodes=$(sort -u "$PBS_NODEFILE" | wc -l)
+workers=${T1_PREP_PPN:-4}
+if (( workers < 1 || workers > 16 )); then
+    echo "T1_PREP_PPN must be between 1 and 16" >&2
+    exit 1
+fi
+mpiexec --pmi=pmix --envall -n "$((nodes * workers))" --ppn "$workers" \
+    --cpu-bind depth --depth 4 \
+    python -u -m distillation.training.T1_single_topo.prepare --mpi \
+    --config "${T1_CONFIG:-$repo/distillation/training/T1_single_topo/config.yaml}" \
+    --seconds "${T1_SECONDS:-3300}"

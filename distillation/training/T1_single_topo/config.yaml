@@ -1,0 +1,29 @@
+cases: [case14, case30, case57, case118, case500]
+seeds: [42, 43, 44]  # Model seeds
+split_seed: 42
+shuffle_seed: 42
+
+paths:
+  raw: /lus/flare/projects/FRAME-IDP/siebenschuh/acopf_datasets/raw/OPFData/dataset_release_1
+  data: /lus/flare/projects/FRAME-IDP/siebenschuh/acopf_datasets/processed/T1
+  output: /lus/flare/projects/FRAME-IDP/siebenschuh/acopf_models/T1
+
+training:
+  max_samples: 1000000
+  batch_size: 64
+  eval_batch_size: 128
+  checkpoint_epochs: 0.5
+  checkpoint_seconds: 300
+  gradient_clip: 1.0
+
+optimizer: {lr: 0.001, weight_decay: 0.0001, eps: 0.00000001}
+
+models:
+  GCN: {hidden_dim: 128, num_layers: 3, dropout: 0.1}
+  GAT: {hidden_dim: 128, num_layers: 3, dropout: 0.1}
+  GIN: {hidden_dim: 128, num_layers: 3, dropout: 0.1}
+  Transformer: {hidden_dim: 128, num_layers: 3, dropout: 0.1}
+  HGT: {hidden_channels: 128, num_layers: 3, num_heads: 4, dropout: 0.1}
+  RGAT: {hidden_channels: 128, num_layers: 3, num_heads: 4}
+  HEAT: {hidden_channels: 128, num_layers: 3, attention_heads: 4}
+  HeteroGNN: {hidden_channels: 128, num_layers: 3, backend: gat}

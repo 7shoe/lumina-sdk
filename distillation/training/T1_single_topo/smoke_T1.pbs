@@ -1,0 +1,24 @@
+#!/usr/bin/env bash
+#PBS -N lumina-t1-smoke
+#PBS -A EpiCalib
+#PBS -q debug
+#PBS -l select=2
+#PBS -l walltime=01:00:00
+#PBS -l filesystems=home:flare
+#PBS -j oe
+set -euo pipefail
+
+source /home/siebenschuh/Projects/reasonABLE/env/Aurora/activate_reason_venv.sh
+cd /home/siebenschuh/Projects/lumina-sdk
+export OMP_NUM_THREADS=4 MKL_NUM_THREADS=4 PYTHONUNBUFFERED=1
+export ZE_FLAT_DEVICE_HIERARCHY=FLAT
+unset MPI4PY_RC_INITIALIZE RANK WORLD_SIZE LOCAL_RANK MPI_LOCALRANKID SLURM_LOCALID PALS_LOCAL_RANKID
+
+workers=${T1_PPN:-3}
+if (( workers < 1 || workers > 6 )); then
+    echo "T1_PPN must be between 1 and 6" >&2
+    exit 1
+fi
+mpiexec --pmi=pmix --envall -n "$((2 * workers))" --ppn "$workers" --cpu-bind depth --depth 4 \
+    python -u -m distillation.training.T1_single_topo.tests.smoke_xpu \
+    --output "/lus/flare/projects/FRAME-IDP/siebenschuh/acopf_models/T1/smoke/${PBS_JOBID%%.*}"
