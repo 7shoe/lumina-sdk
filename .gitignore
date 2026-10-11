@@ -17,8 +17,11 @@ distillation/BAS/aux
 distillation/RAMBO/aux
 # - shared utils
 distillation/solver/aux
+distillation/synthetic/aux
 # - distillation
-
+distillation/DD/aux
+distillation/DC/aux
+distillation/HDMC/aux
 
 # ignore verbose reports
 distillation/solver/reports
