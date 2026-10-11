@@ -12,8 +12,16 @@ distillation/mnist_mvp
 distillation/mnist_mvp/literature
 
 # exclude aux. 
+# - selection
 distillation/BAS/aux
-# distillation/BAS/aux
+distillation/RAMBO/aux
+# - shared utils
+distillation/solver/aux
+# - distillation
+
+
+# ignore verbose reports
+distillation/solver/reports
 
 # distr / packaging
 .Python
