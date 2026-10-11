@@ -1,0 +1,28 @@
+# Unpublished settings below are reconstruction choices, not author values.
+data_root: /lus/flare/projects/FRAME-IDP/siebenschuh/acopf_datasets/processed/T1
+case: case30
+split_seed: 42
+selection_seed: 42
+model_seed: 42
+deterministic: true         # Qualified on Aurora: avoids scatter-related resume divergence
+model: MLP
+model_options: {layers: 3, dropout: 0.1}
+method: bas                 # bas, random, stratified, mcdue, inactive, etc.
+metric: ig                  # le, ig, lg, mcv_p, mcv_l
+loss: l1                    # per-example L1 norm; mse is a separate ablation
+buckets: 30
+partition: quantile         # quantile or width, trained on train inputs only
+panel_size: 1024
+initial_size: 256
+max_selected: 4096
+acquisition_size: 256
+candidate_size: 5000        # only MCDUE scores a candidate pool
+mc_draws: 25
+batch_size: 128
+score_batch_size: 64
+epochs_per_round: 1
+max_rounds: 100
+validation_size: 1024       # zero means the full existing validation split
+checkpoint_seconds: 120
+optimizer: {lr: 0.001, weight_decay: 0.01, betas: [0.9, 0.999], eps: 0.00000001}
+schedule: {minimum: 0.000001, maximum: 0.01, decrease: 0.5, increase: 2.0, patience_lr: 5, patience_acquire: 15}
