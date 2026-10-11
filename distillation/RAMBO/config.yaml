@@ -1,0 +1,17 @@
+data_root: /lus/flare/projects/FRAME-IDP/siebenschuh/acopf_datasets/processed/T1
+raw_root: /lus/flare/projects/FRAME-IDP/siebenschuh/acopf_datasets/raw/OPFData/dataset_release_1
+case: case30
+method: rambo                 # rambo or uniform; same final solver and acceptance.
+warm_start: opf                # Extra lower-OPF warm start; 'feasible' follows Algorithm 2 literally.
+seed: 42
+count: 100                    # Includes the first randomly sampled OPF solution.
+load_bounds: [0.8, 1.2]       # OPFData-envelope experiment; paper experiment: [0.5, 2.0].
+epsilon: 0.0001               # Relaxed complementarity; physical generation cost is unscaled.
+log_delta: 0.00000001         # Declared log(0) stabilization; no smoothing of abs().
+history_size: 30
+variable_size: 30
+tolerance: 0.000001
+duplicate_tolerance: 0.0000001 # Maximum difference divided by each load's allowed interval.
+stage_seconds: 150            # Ipopt CPU-time ceiling.
+request_seconds: 240          # Subprocess wall ceiling, including model construction.
+max_attempts: 1000            # Failed points never fill the requested dataset.
