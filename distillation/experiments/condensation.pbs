@@ -1,0 +1,31 @@
+#!/usr/bin/env bash
+# Resource requests are supplied by `python -m distillation.experiments.study submit`.
+#PBS -N opf-condense
+#PBS -l filesystems=home:flare
+#PBS -j oe
+#PBS -m n
+set -euo pipefail
+export STUDY_STARTED=$(date +%s)  # Include activation, imports and staging in the budget.
+source "${STUDY_ACTIVATE:?}"
+cd "${STUDY_SOURCE:?}"
+export OMP_NUM_THREADS=1 MKL_NUM_THREADS=1 OPENBLAS_NUM_THREADS=1 PYTHONUNBUFFERED=1 PYTHONDONTWRITEBYTECODE=1
+export ZE_FLAT_DEVICE_HIERARCHY=FLAT
+unset MPI4PY_RC_INITIALIZE RANK WORLD_SIZE LOCAL_RANK LOCAL_WORLD_SIZE MPI_LOCALRANKID SLURM_LOCALID PALS_LOCAL_RANKID STUDY_INPUT_MAP
+nodes=$(wc -l < "$PBS_NODEFILE")
+if [[ ${STUDY_COPPER:-0} == 1 ]]; then
+    module load copper
+    study_copper_mount="/tmp/${USER}/lumina-copper-${PBS_JOBID%%.*}"
+    study_copper_logs="${STUDY_SOURCE%/source}/jobs/copper"
+    # Installed Aurora wrappers have the platform suffix; newer modules omit it.
+    study_copper_launch=$(command -v launch_copper.sh || command -v launch_copper_aurora.sh)
+    study_copper_stop=$(command -v stop_copper.sh || command -v stop_copper_aurora.sh)
+    trap 'bash "$study_copper_stop" -d "$study_copper_logs" -v "$study_copper_mount"' EXIT
+    bash "$study_copper_launch" -d "$study_copper_logs" -v "$study_copper_mount"
+    # Cache the custom packages only; retain the system PyTorch/XPU installation.
+    study_python_version=$(python -c 'import sys; print(f"{sys.version_info.major}.{sys.version_info.minor}")')
+    export PYTHONPATH="${study_copper_mount}${VIRTUAL_ENV:?}/lib/python${study_python_version}/site-packages${PYTHONPATH:+:${PYTHONPATH}}"
+fi
+# Keep Copper service cores 48-51 free (also valid when Copper is disabled).
+mpiexec --pmi=pmix --envall -n "$((nodes * 12))" --ppn 12 --cpu-bind list:4:56:9:61:14:66:19:71:20:74:25:79 \
+    python -u -m distillation.synthetic.campaign --manifest "${STUDY_MANIFEST:?}" \
+    --allocation-seconds "${STUDY_BUDGET:?}"

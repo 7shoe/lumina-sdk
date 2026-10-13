@@ -1,0 +1,132 @@
+# One study definition. `study preview/prepare --profile smoke` selects the checks below.
+schema_version: 1
+campaign: data_methods_20261012_v2
+paths:
+  output: /lus/flare/projects/FRAME-IDP/siebenschuh/acopf_datasets/dataset_distillation
+  models: /lus/flare/projects/FRAME-IDP/siebenschuh/acopf_models/synthetic
+  generated: /lus/flare/projects/FRAME-IDP/siebenschuh/acopf_datasets/dataset_selection/RAMBO
+  data: /lus/flare/projects/FRAME-IDP/siebenschuh/acopf_datasets/processed/T1
+  raw: /lus/flare/projects/FRAME-IDP/siebenschuh/acopf_datasets/raw/OPFData/dataset_release_1
+  references: /lus/flare/projects/FRAME-IDP/siebenschuh/acopf_datasets/dataset_distillation/dd_100x100_20261012/references
+  # Optional, read-only cache import. Only matching fingerprints are reused.
+  initializations: /lus/flare/projects/FRAME-IDP/siebenschuh/acopf_datasets/dataset_distillation/dd_100x100_20261012/initializations
+matrix:
+  cases: [30, 57, 118]
+  protocols: [conservative, random_fixed, random_size]
+  target_modes: [solver, frozen, learned]
+  initializations: [random]
+  seeds: [42]                       # Independent synthesis replications; split remains 42.
+shared:
+  synthetic_count: 100
+  batch_size: 10                    # 10 batches, derived rather than specified twice.
+  strength: 0.10                    # Operational edits during synthesis, not initialization.
+  split_seed: 42
+  model_precision: float64
+  real_batch: 64                    # Per XPU; 12 replicas give 768 matching/outer examples.
+  training_seconds: 2400            # Cumulative synthesis budget per condition across resumes.
+  max_updates: 1000                 # Outer/matching updates, not student SGD updates.
+  checkpoint_seconds: 120
+  eval_seconds: 300
+  reserve_seconds: 300
+  qualify: true
+model_defaults: {width: 128, layers: 3}
+bus_limits: {30: [23, 38], 57: [43, 71], 118: [89, 148]}
+initialization:
+  random: {mode: random, model_seed: 1000000}
+  fixed: {mode: fixed, model_seed: 1000000}
+  T1_case57:
+    mode: pretrained
+    checkpoint_pattern: /lus/flare/projects/FRAME-IDP/siebenschuh/acopf_models/T1/checkpoints/{model}/pglib_opf_case57_ieee/seed42/best.pt
+methods:
+  DD:
+    models: [GAT, GIN, HeteroGNN]
+    settings: {passes: 10, inner_rate: 0.000001, outer_rate: 0.03, outer_target_rate: 0.003, topology_every: 0, common_evaluation: true}
+  DCGM:
+    models: [GAT, GIN, HeteroGNN]
+    settings: {data_rate: 0.1, target_rate: 0.003, restart_rounds: 11, student_epochs: 1}
+  HMDC:
+    pairs: [[GIN, GAT], [GIN, HeteroGNN]]
+    settings: {data_rate: 0.005, target_rate: 0.003, restart_rounds: 100, real_steps: 2, query_interval: 10, candidate_pool: 256}
+  RAMBO:
+    models: [GAT, GIN, HeteroGNN]     # Evaluators only; never used by generation.
+    domains: {opfdata_envelope: [0.8, 1.2]}
+    samplers: [rambo, uniform]      # Same final solver, bounds and accepted count.
+    settings: {warm_start: opf, max_attempts: 1000}
+evaluation:
+  evaluation_epochs: 10             # 100 ordinary-SGD updates for all methods.
+  validation_samples: 256           # Dataset selection panel.
+  final_samples: 1024               # Disjoint validation reporting panel; test untouched.
+  eval_batch: 128
+  student_rates: [0.00000001, 0.0000001, 0.000001, 0.00001, 0.0001, 0.001]
+  calibration_samples: 128          # Train only.
+  calibration_panels: 2
+  trace_every: 10
+  trace_samples: 32
+execution:
+  layout: combined                  # Or separate: one job per selected method.
+  nodes: 3                         # Nodes per submitted job; one 12-XPU team per condition.
+  ranks_per_node: 12
+  account: EpiCalib
+  queue: debug-scaling
+  walltime: '01:00:00'
+  allocation_seconds: 3300
+  staging: true                    # One verified copy of assigned inputs per node, shared by its 12 workers.
+  copper: true                     # Cooperative cache for the custom Python environment.
+  activate: /home/siebenschuh/Projects/reasonABLE/env/Aurora/activate_reason_venv.sh
+profiles:
+  reference: {}
+  smoke:
+    matrix: {cases: [30], protocols: [conservative], target_modes: [learned]}
+    shared: {max_updates: 2, real_batch: 4, checkpoint_seconds: 30}
+    evaluation:
+      validation_samples: 16
+      final_samples: 16
+      calibration_samples: 16
+      calibration_panels: 1
+      student_rates: [0.0000001, 0.000001]
+      trace_samples: 4
+    methods:
+      DD:
+        models: [GIN]
+        settings: {inner_rate: 0.0000001, real_control_rates: [0.0000001, 0.000001], profile_real_batches: [4]}
+      DCGM:
+        models: [GCN, GAT, RGAT, GIN, HGT, HEAT, HeteroGNN, Transformer]
+      HMDC:
+        pairs: [[GIN, GAT], [HeteroGNN, Transformer], [HGT, HEAT], [GCN, RGAT]]
+        settings: {candidate_pool: 16}
+      RAMBO:
+        models: [GIN, GAT]
+    # These selections augment (not multiply) the main smoke matrix.
+    extra_conditions:
+      - {methods: [DD, DCGM, HMDC], models: [GIN], pairs: [[GIN, GAT]], cases: [30], protocols: [conservative], target_modes: [solver, frozen], initializations: [fixed], seeds: [42]}
+      - {methods: [DD, DCGM, HMDC], models: [GIN], pairs: [[GIN, GAT]], cases: [118], protocols: [random_size], target_modes: [learned], initializations: [random], seeds: [42]}
+      - {methods: [DD, DCGM, HMDC], models: [GIN], pairs: [[GIN, GAT]], cases: [30], protocols: [conservative], target_modes: [learned], initializations: [T1_case57], seeds: [42]}
+  # Small end-to-end integration check. These are NOT the 100-grid reference experiments.
+  integration_smoke:
+    matrix: {cases: [30], protocols: [conservative], target_modes: [solver], initializations: [random]}
+    shared: {synthetic_count: 4, batch_size: 2, max_updates: 2, real_batch: 2, min_topologies: 1, checkpoint_seconds: 30}
+    model_defaults: {width: 8, layers: 2}
+    evaluation:
+      evaluation_epochs: 2
+      validation_samples: 4
+      final_samples: 8
+      eval_batch: 4
+      calibration_samples: 8
+      calibration_panels: 1
+      student_rates: [0.0000001, 0.000001]
+      trace_every: 1
+      trace_samples: 4
+    methods:
+      DD:
+        models: [GIN]
+        settings: {passes: 2, inner_rate: 0.0000001, real_control_rates: [0.0000001, 0.000001], profile_real_batches: [2]}
+      DCGM:
+        models: [GIN]
+      HMDC:
+        pairs: [[GIN, GAT]]
+        settings: {candidate_pool: 8}
+      RAMBO:
+        models: [GIN, GAT]
+    execution: {nodes: 1, queue: debug}
+    extra_conditions:
+      - {methods: [RAMBO], models: [GIN], cases: [30], protocols: [conservative], target_modes: [solver], initializations: [T1_case57], seeds: [42]}

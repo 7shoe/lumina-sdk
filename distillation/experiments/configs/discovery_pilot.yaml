@@ -1,0 +1,82 @@
+# One-seed discovery pilot; 30 condensation runs and four shared generated libraries.
+schema_version: 1
+campaign: discovery_20261013
+paths:
+  output: /lus/flare/projects/FRAME-IDP/siebenschuh/acopf_datasets/dataset_distillation
+  models: /lus/flare/projects/FRAME-IDP/siebenschuh/acopf_models/synthetic
+  generated: /lus/flare/projects/FRAME-IDP/siebenschuh/acopf_datasets/dataset_selection/RAMBO
+  data: /lus/flare/projects/FRAME-IDP/siebenschuh/acopf_datasets/processed/T1
+  raw: /lus/flare/projects/FRAME-IDP/siebenschuh/acopf_datasets/raw/OPFData/dataset_release_1
+  references: /lus/flare/projects/FRAME-IDP/siebenschuh/acopf_datasets/dataset_distillation/dd_100x100_20261012/references
+  initializations: /lus/flare/projects/FRAME-IDP/siebenschuh/acopf_datasets/dataset_distillation/dd_100x100_20261012/initializations
+matrix:
+  cases: [30, 57]
+  protocols: [conservative]
+  target_modes: [learned]
+  initializations: [random]
+  seeds: [42]
+shared:
+  synthetic_count: 100
+  batch_size: 10
+  strength: 0.10
+  split_seed: 42
+  model_precision: float64
+  real_batch: 64
+  training_seconds: 800
+  max_updates: 1000
+  checkpoint_seconds: 120
+  eval_seconds: 300
+  reserve_seconds: 300
+  qualify: true
+model_defaults: {width: 128, layers: 3}
+bus_limits: {30: [23, 38], 57: [43, 71]}
+initialization:
+  random: {mode: random, model_seed: 1000000}
+  fixed: {mode: fixed, model_seed: 1000000}
+  T1_case30:
+    mode: pretrained
+    checkpoint_pattern: /lus/flare/projects/FRAME-IDP/siebenschuh/acopf_models/T1/checkpoints/{model}/pglib_opf_case30_ieee/seed42/best.pt
+methods:
+  DD:
+    models: [GIN, GAT, HEAT]
+    settings: {passes: 10, inner_rate: 0.000001, outer_rate: 0.03, outer_target_rate: 0.003, topology_every: 0, common_evaluation: true, profile_real_batches: [64]}
+  DCGM:
+    models: [GIN, GAT, HEAT]
+    settings: {data_rate: 0.1, target_rate: 0.003, restart_rounds: 11, student_epochs: 1}
+  HMDC:
+    pairs: [[GIN, HEAT]]
+    settings: {data_rate: 0.005, target_rate: 0.003, restart_rounds: 100, real_steps: 2, query_interval: 10, candidate_pool: 256, evaluation_models: [GIN, HEAT, GAT]}
+  RAMBO:
+    models: [GIN, GAT, HEAT]
+    domains: {opfdata_envelope: [0.8, 1.2]}
+    samplers: [rambo, uniform]
+    settings: {warm_start: opf, max_attempts: 1000}
+evaluation:
+  evaluation_epochs: 10
+  validation_samples: 256
+  final_samples: 1024
+  retention_samples: 256           # Final source-case validation only; never selects rates/data.
+  eval_batch: 128
+  student_rates: [0.00000001, 0.0000001, 0.000001, 0.00001, 0.0001, 0.001]
+  calibration_samples: 128
+  calibration_panels: 2
+  trace_every: 10
+  trace_samples: 32
+execution:
+  layout: combined
+  nodes: 32
+  ranks_per_node: 12
+  account: EpiCalib
+  queue: debug-scaling
+  walltime: '01:00:00'
+  allocation_seconds: 3300
+  staging: true
+  copper: true
+  verify_run: true                 # Pause/resume after one update; replay the final export.
+  activate: /home/siebenschuh/Projects/reasonABLE/env/Aurora/activate_reason_venv.sh
+profiles:
+  pilot:
+    extra_conditions:
+      - {methods: [DD, DCGM, HMDC], cases: [30], protocols: [conservative], target_modes: [learned], initializations: [fixed], seeds: [42]}
+      - {methods: [DD, DCGM, HMDC, RAMBO], cases: [57], protocols: [conservative], target_modes: [learned], initializations: [T1_case30], seeds: [42]}
+      - {methods: [DD, DCGM], models: [GAT], cases: [30], protocols: [random_fixed], target_modes: [learned], initializations: [random], seeds: [42]}
