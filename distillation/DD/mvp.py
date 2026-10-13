@@ -17,6 +17,7 @@ from experiments.lumina_bench.runner import build_model
 
 
 from distillation.synthetic.learning import benchmark_batch, benchmark_graph, targets, mse
+from distillation.synthetic.inputs import teaching_values
 
 
 class SyntheticOPF(nn.Module):
@@ -26,12 +27,13 @@ class SyntheticOPF(nn.Module):
     graph sizes may differ after an outer topology-search step. Derived Y is a
     differentiable function of physical branch parameters, not a free dense matrix.
     Zero offsets reproduce the seed inputs/targets up to reciprocal roundoff.
-    Teaching targets are synthetic regression supervision, never exported as an
-    AC-OPF solution. A separate, detached solver audit checks the edited inputs.
+    Solver, frozen and independently learned teaching targets are stored apart
+    from physical solution certificates. A detached solver audit checks inputs.
     """
 
     def __init__(self, graphs, *, steps=3, strength=0.02, target_strength=0.02,
-                 learn_targets=True, initial_rate=1e-6, rate_min=1e-8, rate_max=1e-4):
+                 learn_targets=True, initial_rate=1e-6, rate_min=1e-8, rate_max=1e-4,
+                 target_mode=None, learn_inputs=True, learn_rates=True):
         super().__init__()
         if not graphs or steps < 1 or len(graphs) % steps:
             raise ValueError("Need a nonempty dataset evenly divided into K inner batches")
@@ -39,6 +41,9 @@ class SyntheticOPF(nn.Module):
             raise ValueError("Expected 0 < strength < 1 and 0 <= target_strength < 1")
         if not 0 < rate_min < initial_rate < rate_max or not math.isfinite(rate_max):
             raise ValueError("Expected finite 0 < rate_min < initial_rate < rate_max")
+        self.target_mode = target_mode or 'legacy'
+        if self.target_mode not in ('legacy', 'solver', 'frozen', 'learned'):
+            raise ValueError('target_mode must be solver, frozen or learned')
         graphs = [graph.clone().detach().cpu() for graph in graphs]
         self.anchors = [opf2mat(graph) for graph in graphs]
         if any(matrix.params.N < 1 or matrix.params.G < 1 for matrix in self.anchors):
@@ -47,9 +52,10 @@ class SyntheticOPF(nn.Module):
         self.strength, self.target_strength = strength, target_strength
         self.rate_min, self.rate_max = rate_min, rate_max
         self.edits = nn.ModuleList([Perturbation(matrix) for matrix in self.anchors])
+        self.edits.requires_grad_(learn_inputs)
         self.target_offsets = nn.ModuleList([
             nn.ParameterDict({kind: nn.Parameter(torch.zeros_like(graph[kind].y),
-                                                requires_grad=learn_targets)
+                                                requires_grad=learn_targets and self.target_mode in ('legacy', 'learned'))
                               for kind in ("bus", "generator")})
             for graph in graphs
         ])
@@ -57,7 +63,7 @@ class SyntheticOPF(nn.Module):
                              for graph in graphs]
         probability = (initial_rate - rate_min) / (rate_max - rate_min)
         self.rate_logits = nn.Parameter(torch.full(
-            (steps,), math.log(probability / (1 - probability)), dtype=torch.float64))
+            (steps,), math.log(probability / (1 - probability)), dtype=torch.float64), requires_grad=learn_rates)
         with torch.no_grad():
             for edit in self.edits:
                 for parameter in edit.parameters():
@@ -70,6 +76,12 @@ class SyntheticOPF(nn.Module):
     def matrices(self):
         return [edit(matrix, self.strength) for edit, matrix in zip(self.edits, self.anchors)]
 
+    def freeze_unused_features(self, kind):
+        if kind in ('GCN', 'HGT', 'RGAT'):
+            for edit in self.edits:
+                for key in ('admittance', 'thermal'):
+                    edit.delta[key].requires_grad_(False)
+
     def batch(self, step):
         if step not in range(self.steps):
             raise IndexError(step)
@@ -78,13 +90,10 @@ class SyntheticOPF(nn.Module):
         for i in indices:
             matrix = self.edits[i](self.anchors[i], self.strength)
             graphs.append(mat2opf(matrix, include_solution=False))
+            values = teaching_values(self.seed_targets[i], self.target_offsets[i],
+                self.anchors[i].params.bus_type == 3, self.target_mode, self.target_strength)
             for kind in teaching:
-                base = self.seed_targets[i][kind]
-                delta = self.target_strength * base.abs().clamp_min(0.1) * self.target_offsets[i][kind].tanh()
-                if kind == "bus":
-                    reference = self.anchors[i].params.bus_type == 3
-                    delta = torch.stack((delta[:, 0] * (~reference), delta[:, 1]), dim=1)
-                teaching[kind].append(base + delta)
+                teaching[kind].append(values[kind])
         return benchmark_batch(graphs), {kind: torch.cat(value) for kind, value in teaching.items()}
 
 
@@ -211,6 +220,7 @@ def check_derivatives(cpu_model, graphs, real_batch, real_targets, options, devi
     for target_device in (torch.device("cpu"), device):
         model = deepcopy(cpu_model).to(target_device)
         synthetic = SyntheticOPF(graphs, **options)
+        synthetic.freeze_unused_features(getattr(model, 'kind', None))
         _, loss, _ = unroll(model, synthetic, real_batch, real_targets)
         if not torch.isfinite(loss):
             raise FloatingPointError(f"Nonfinite unroll on {target_device}")

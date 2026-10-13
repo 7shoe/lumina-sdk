@@ -74,3 +74,25 @@ def load_batch(raw_root, case=14, *, count=10, seed=42, group=0, split="test"):
         records = [found[int(i)] for i in indices]
     
     return [native_graph(record) for record in records], indices
+
+
+def load_ids(raw_root, case, indices):
+    """Load specified full-split IDs in native precision, streaming each archive once."""
+    case, root = canonical_case(f'case{case}'), Path(raw_root)
+    indices = [int(i) for i in indices]
+    found = {}
+    for group in sorted({i // 15_000 for i in indices}):
+        wanted = {i for i in indices if i // 15_000 == group}
+        with tarfile.open(root / f'{case}_{group}.tar.gz', 'r|gz') as archive:
+            for member in archive:
+                if not member.isfile():
+                    continue
+                index = int(Path(member.name).stem.removeprefix('example_'))
+                if index in wanted:
+                    found[index] = native_graph(json.load(archive.extractfile(member)))
+                    wanted.remove(index)
+                    if not wanted:
+                        break
+        if wanted:
+            raise ValueError(f'Missing reference IDs: {sorted(wanted)}')
+    return [found[i] for i in indices]

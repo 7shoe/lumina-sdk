@@ -1,16 +1,15 @@
 """Resumable Wang-style OPF distillation, one independent experiment per MPI node.
 
-Continuous meta-gradients average independent initializations/real minibatches.
+Continuous meta-gradients average real minibatches and optionally initializations.
 Discrete, solver-gated topology proposals never enter autograd. Training splits
-are fixed at seed 42. Validation and model-seed panels are held out from training.
+are fixed at seed 42. Validation examples are held out; random-mode evaluation
+also uses unseen model seeds.
 """
 from __future__ import annotations
 
 import argparse
-from contextlib import redirect_stdout
 from copy import deepcopy
 import hashlib
-import io
 import json
 import math
 import os
@@ -36,13 +35,17 @@ from distillation.DD.topology import (batch_report,
 
 from distillation.conversion.matrix_form import mat2opf
 from distillation.solver import ACOPF
-from distillation.synthetic.learning import benchmark_graph
+from distillation.synthetic.learning import (model_for, model_from_export, model_options,
+                                             pretrained_config, validate_initialization)
+from distillation.synthetic.runtime import collectively
+from distillation.synthetic.experiments import case_bus_range, common_config
+from distillation.synthetic.inputs import changes_summary as physical_changes
+from experiments.lumina_bench.models import SUPPORTED_MODELS
 from distillation.training.T1_single_topo.common import (atomic_file,
                                                          canonical_case,
                                                          claim,
                                                          write_json)
-from distillation.training.T1_single_topo.data import CaseDataset
-from experiments.lumina_bench.runner import build_model
+from distillation.experiments.staging import case_dataset as CaseDataset
 
 # path management
 ROOT = Path(__file__).resolve().parents[2]
@@ -62,19 +65,25 @@ def log(path, event):
     print(json.dumps(event, allow_nan=False), flush=True)
 
 
-def model_options(kind, width=32, layers=2):
-    return ({'hidden_channels': width, 'num_layers': layers, 'backend': 'gat'}
-            if kind == 'HeteroGNN' else
-            {'hidden_dim': width, 'num_layers': layers, 'dropout': 0.0})
+def validate_config(config):
+    if config['model'] not in SUPPORTED_MODELS:
+        raise ValueError(f'Unknown model: {config["model"]}')
+    if any(type(config[k]) is not int or config[k] < 1 for k in ('batches', 'batch_size', 'passes')):
+        raise ValueError('Positive integer batches, batch_size and passes required')
+    if config['synthetic_count'] != config['batches'] * config['batch_size']:
+        raise ValueError('synthetic_count must equal batches * batch_size')
+    if config.get('split_seed', 42) != 42:
+        raise ValueError('The benchmark split remains fixed at seed 42')
+    validate_initialization(config)
+    if config.get('target_mode', 'legacy') not in ('legacy', 'solver', 'frozen', 'learned'):
+        raise ValueError('Unknown target_mode')
+    if config.get('topology_every') and config.get('target_mode') in ('frozen', 'learned'):
+        raise ValueError('Online topology edits need target correspondence; use topology_every=0 for frozen/learned')
 
 
-def model_for(graph, config, seed, device):
-    kind = config['model']
-    with torch.random.fork_rng(devices=[]), redirect_stdout(io.StringIO()):
-        torch.manual_seed(seed)
-        model = build_model({'model_type': kind, 'models': {kind: config['model_options']}},
-                            benchmark_graph(graph), torch.device('cpu'))
-    return model.to(device).eval()
+def student_seed(config, iteration, rank, world):
+    base = config.get('model_seed', 1_000_000)
+    return base if config.get('initialization') in ('fixed', 'pretrained') else config.get('training_model_seed', base) + iteration * world + rank
 
 
 class Schedule(SyntheticOPF):
@@ -82,12 +91,18 @@ class Schedule(SyntheticOPF):
     def __init__(self, graphs, config):
         super().__init__(graphs, steps=config['batches'], strength=config['strength'],
                          target_strength=config['target_strength'], initial_rate=config['inner_rate'],
-                         rate_min=config['rate_min'], rate_max=config['rate_max'])
+                         rate_min=config['rate_min'], rate_max=config['rate_max'],
+                         target_mode=config.get('target_mode'),
+                         learn_inputs=config.get('learn_inputs', True), learn_rates=config.get('learn_rates', True))
         self.passes = config['passes']
-        self.rate_logits = torch.nn.Parameter(self.rate_logits.detach().repeat(self.passes))
+        self.rate_logits = torch.nn.Parameter(self.rate_logits.detach().repeat(self.passes),
+                                             requires_grad=self.rate_logits.requires_grad)
+        # These benchmark backbones do not consume branch attributes. With
+        # detached OPF labels there is no differentiable path from these edits.
+        self.freeze_unused_features(config['model'])
 
 
-def inner(model, synthetic, *, create_graph):
+def inner(model, synthetic, *, create_graph, observe=None):
     device = next(model.parameters()).device
     theta = {name: p.detach().clone().requires_grad_(True) for name, p in model.named_parameters()}
     buffers = {name: p.detach().clone() for name, p in model.named_buffers()}
@@ -95,6 +110,8 @@ def inner(model, synthetic, *, create_graph):
     batches = [(b.to(device), {k: t.to(device) for k, t in y.items()})
                for b, y in (synthetic.batch(k) for k in range(synthetic.steps))]
     rates = synthetic.rates.to(device)
+    if observe is not None:
+        observe(0, theta, buffers)
     for step in range(synthetic.steps * synthetic.passes):
         batch, target = batches[step % synthetic.steps]
         loss = mse(functional_call(model, (theta, buffers), (batch,), strict=True), target, batch)
@@ -103,6 +120,8 @@ def inner(model, synthetic, *, create_graph):
                  for (key, p), g in zip(theta.items(), grad)}
         if not create_graph:
             theta = {key: p.detach().requires_grad_(True) for key, p in theta.items()}
+        if observe is not None:
+            observe(step + 1, theta, buffers)
     return theta, buffers
 
 
@@ -200,7 +219,17 @@ def collective_audit(synthetic, comm):
 
 
 def optimizer_for(synthetic, config):
-    return torch.optim.Adam(synthetic.parameters(), lr=config['outer_rate'])
+    # Legacy checkpoints retain their original single optimizer group.
+    if 'target_mode' not in config:
+        return torch.optim.Adam(synthetic.parameters(), lr=config['outer_rate'])
+    groups = []
+    for name, parameters in (('input', synthetic.edits.parameters()),
+                             ('target', synthetic.target_offsets.parameters()),
+                             ('rate', [synthetic.rate_logits])):
+        params = [p for p in parameters if p.requires_grad]
+        if params:
+            groups.append(dict(params=params, lr=config.get(f'outer_{name}_rate', config['outer_rate'])))
+    return torch.optim.Adam(groups)
 
 
 def transplant(old, graphs, config, changed, optimizer=None):
@@ -214,6 +243,9 @@ def transplant(old, graphs, config, changed, optimizer=None):
         if not replaced(name):
             state[name] = value.clone()
     new.load_state_dict(state)
+    for i in range(len(graphs)):
+        if i not in changed:
+            new.seed_targets[i] = deepcopy(old.seed_targets[i])
     new_optimizer = optimizer_for(new, config)
     if optimizer is not None:
         old_named = dict(old.named_parameters())
@@ -223,9 +255,84 @@ def transplant(old, graphs, config, changed, optimizer=None):
     return new, new_optimizer
 
 
-def evaluation(model, synthetic, dataset, ids, batch_size=128, *, trained=True):
+def proposal_step(synthetic, optimizer, config, reference, score, audit):
+    """Transactional line search. Solver-mode proposals are scored AFTER relabelling."""
+    before = deepcopy(synthetic.state_dict())
+    moments, labels = deepcopy(optimizer.state_dict()), deepcopy(synthetic.seed_targets)
+    accepted, attempts, physical, checks = False, [], None, None
+    refresh = synthetic.target_mode == 'solver' or (
+        synthetic.target_mode == 'legacy' and config.get('fresh_solver_targets', False))
+    try:
+        optimizer.step()
+        proposal = deepcopy(synthetic.state_dict())
+        for fraction in config.get('backtrack_fractions', (1., .5, .25, .125, .0625)):
+            if not 0 < fraction <= 1:
+                raise ValueError('Backtracking fractions must be in (0, 1]')
+            synthetic.load_state_dict({k: v + fraction * (proposal[k] - v) for k, v in before.items()})
+            synthetic.seed_targets = deepcopy(labels)
+            trial = dict(fraction=fraction, real_mse=None, feasible=None, accepted=False)
+            # Preserve the old order only for legacy configurations. In frozen/
+            # learned mode the teaching targets do not depend on this audit.
+            if synthetic.target_mode != 'solver':
+                value = score()
+                trial['real_mse'] = value if math.isfinite(value) else None
+                if not math.isfinite(value) or value > reference:
+                    trial['reason'] = 'nonfinite_objective' if not math.isfinite(value) else 'objective'
+                    attempts.append(trial)
+                    continue
+            ok, proposed, rows = audit()
+            trial['feasible'] = ok
+            trial['solver_failures'] = sum(not r['success'] for r in rows)
+            trial['nonconverged'] = sum(not r.get('converged', r['success']) for r in rows)
+            if ok and refresh:
+                synthetic.seed_targets = [{k: g[k].y.detach().clone() for k in ('bus', 'generator')}
+                                          for g in proposed]
+            if ok and refresh:
+                value = score()
+                trial['real_mse'] = value if math.isfinite(value) else None
+                ok = math.isfinite(value) and value <= reference
+            trial['reason'] = 'accepted' if ok else ('solver' if not trial['feasible'] else 'objective')
+            trial['accepted'] = ok
+            attempts.append(trial)
+            if ok:
+                accepted, physical, checks = True, proposed, rows
+                break
+    finally:
+        if not accepted:
+            synthetic.load_state_dict(before)
+            synthetic.seed_targets = labels
+            optimizer.load_state_dict(moments)
+    return accepted, physical, checks, attempts
+
+
+def changes_summary(synthetic):
+    return physical_changes(synthetic)
+
+
+def evaluation(model, synthetic, dataset, ids, batch_size=128, *, trained=True,
+               trace=None, trace_every=10, trace_samples=32):
+    started, probe_seconds = time.monotonic(), 0.
+    device = next(model.parameters()).device
+    probe = graph_batch(dataset, ids[:trace_samples]).to(next(model.parameters()).device) if trace is not None else None
+    def observe(step, theta, buffers):
+        nonlocal probe_seconds
+        if step % trace_every and step != synthetic.steps * synthetic.passes:
+            return
+        # Charge queued accelerator work to student training, not to the probe.
+        if device.type == 'xpu':
+            torch.xpu.synchronize(device)
+        elif device.type == 'cuda':
+            torch.cuda.synchronize(device)
+        seconds = time.monotonic() - started - probe_seconds
+        tick = time.monotonic()
+        with torch.no_grad():
+            value = float(mse(functional_call(model, (theta, buffers), (probe,), strict=True),
+                              {k: probe[k].y for k in ('bus', 'generator')}, probe))
+        trace.append(dict(step=step, graph_presentations=step * synthetic.batch_size,
+                          real_mse=value if math.isfinite(value) else None, student_seconds=seconds))
+        probe_seconds += time.monotonic() - tick
     if trained:
-        theta, buffers = inner(model, synthetic, create_graph=False)
+        theta, buffers = inner(model, synthetic, create_graph=False, observe=observe if trace is not None else None)
     else:
         theta, buffers = dict(model.named_parameters()), dict(model.named_buffers())
     value = 0.0
@@ -241,20 +348,33 @@ def evaluation(model, synthetic, dataset, ids, batch_size=128, *, trained=True):
 def score_summary(scores):
     finite = all(math.isfinite(x) for x in scores)
     return {'mean': float(np.mean(scores)) if finite else None,
+            'median': float(np.median(scores)) if finite else None,
             'std': float(np.std(scores)) if finite else None,
             'per_initialization': [x if math.isfinite(x) else None for x in scores],
             'nonfinite_initializations': sum(not math.isfinite(x) for x in scores)}
 
 
 def panel(synthetic, config, dataset, ids, comm, device, seed_base=10_000_000, trained=True):
-    model = model_for(mat2opf(synthetic.anchors[0]), config, seed_base + comm.rank, device)
-    value, theta, buffers = evaluation(model, synthetic, dataset, ids, config['eval_batch'], trained=trained)
+    config = pretrained_config(config)
+    seed = config.get('model_seed', 1_000_000) if config.get('initialization') in ('fixed', 'pretrained') else seed_base + comm.rank
+    model = model_for(mat2opf(synthetic.anchors[0]), config, seed, device)
+    trace = [] if config.get('trace_every', 0) and trained else None
+    value, theta, buffers = evaluation(model, synthetic, dataset, ids, config['eval_batch'], trained=trained,
+                                      trace=trace, trace_every=config.get('trace_every', 10),
+                                      trace_samples=config.get('trace_samples', 32))
     scores = comm.allgather(value)
     record = score_summary(scores) | {
-        'model_seeds': list(range(seed_base, seed_base + comm.size)), 'real_examples': len(ids)}
-    student = {'initial_state': {k: v.detach().cpu() for k, v in model.state_dict().items()},
+        'model_seeds': comm.allgather(seed), 'real_examples': len(ids),
+        'initialization': config.get('initialization', 'random')}
+    record['unique_initializations'] = len(set(record['model_seeds']))
+    if config.get('initialization') == 'pretrained':
+        record['pretrained_sha256'] = config['pretrained']['sha256']
+    if trace is not None:
+        record['learning_curves'] = comm.allgather(trace)
+        record['curve_examples'] = min(len(ids), config.get('trace_samples', 32))
+    student = {'initial_state': {k: v.detach().cpu().clone() for k, v in model.state_dict().items()},
                'trained_state': theta | {k: v.detach().cpu() for k, v in buffers.items()},
-               'seed': seed_base + comm.rank, 'model': config['model'], 'model_options': config['model_options']}
+               'seed': seed, 'model': config['model'], 'model_options': config['model_options']}
     return record, student
 
 
@@ -285,36 +405,53 @@ def restore(payload):
 def export(folder, synthetic, config, state, physical, checks, student, name='distilled.pt'):
     with torch.no_grad():
         schedule = []
+        batches = [synthetic.batch(k) for k in range(synthetic.steps)]
         for step in range(synthetic.steps * synthetic.passes):
-            batch, teaching = synthetic.batch(step % synthetic.steps)
+            batch, teaching = batches[step % synthetic.steps]
             schedule.append({'step': step, 'batch': step % synthetic.steps, 'inputs': batch.detach().cpu(),
                              'teaching_targets': {k: v.detach().cpu() for k, v in teaching.items()},
                              'rate': float(synthetic.rates[step])})
     save(folder / name, {'format': FORMAT, 'config': config, 'training_state': state,
                         'schedule': schedule, 'physical_solved_graphs': physical,
                         'solver_checks': checks, 'model_checkpoint': student,
-                        'target_semantics': ('fresh detached AC-OPF labels' if config.get('fresh_solver_targets') else
-                                             'learned teaching targets; physical solutions stored separately')})
+                        'anchor_graphs': [mat2opf(m) for m in synthetic.anchors],
+                        'synthetic_state': synthetic.state_dict(), 'seed_targets': synthetic.seed_targets,
+                        'target_mode': synthetic.target_mode,
+                        'target_semantics': {'solver': 'fresh detached AC-OPF solutions',
+                            'frozen': 'initial fixed teaching targets; not certified solutions of edited grids',
+                            'learned': 'independent learned teaching targets; not certified AC-OPF solutions',
+                            'legacy': 'legacy bounded offsets; inspect target_strength and fresh_solver_targets'}[synthetic.target_mode]})
     save(folder / 'student.pt', student)
 
 
 def run(config, folder, comm, device, *, allocation_seconds=3100, qualify=False, stop_after_updates=None):
     """Train for a cumulative time budget; resume from the last atomic commit."""
     from mpi4py import MPI
+    validate_config(config)
+    config = collectively(comm, lambda: pretrained_config(config, refresh=True))
+    error = None
     started = time.monotonic()
     folder = Path(folder)
     if comm.rank == 0:
         folder.mkdir(parents=True, exist_ok=True)
-        write_json(folder / 'config.json', config)
     comm.Barrier()
     dataset = CaseDataset(config['data_root'], f"case{config['case']}")
     split = dataset.splits(42)
     payload = None
-    if comm.rank == 0 and (folder / 'latest.pt').exists():
-        payload = torch.load(folder / 'latest.pt', weights_only=False, map_location='cpu')
-        if payload['config'] != config:
-            raise ValueError('Resume configuration differs; use a new experiment directory')
+    if comm.rank == 0:
+        try:
+            if (folder / 'latest.pt').exists():
+                payload = torch.load(folder / 'latest.pt', weights_only=False, map_location='cpu')
+                if payload['config'] != config:
+                    raise ValueError('Resume configuration or pretrained checkpoint differs; use a new experiment directory')
+        except Exception as exc:
+            error = f'{type(exc).__name__}: {exc}'
+    error = comm.bcast(error, root=0)
+    if error:
+        raise ValueError(error)
     payload = comm.bcast(payload, root=0)
+    if comm.rank == 0:
+        write_json(folder / 'config.json', config)
     if payload:
         synthetic, optimizer = restore(payload)
         state = payload['state']
@@ -354,7 +491,8 @@ def run(config, folder, comm, device, *, allocation_seconds=3100, qualify=False,
                 raise RuntimeError('Initial real seeds failed fresh AC-OPF solves')
             # Diverse, feasible initial topology; later discrete updates optimize the objective.
             local, local_changes = generate_dataset(1, physical[comm.rank::comm.size],
-                min_buses=bus_limits(config['case'])[0], max_buses=bus_limits(config['case'])[1],
+                min_buses=config.get('bus_range', bus_limits(config['case']))[0],
+                max_buses=config.get('bus_range', bus_limits(config['case']))[1],
                 seed=config['data_seed'] + comm.rank, max_edits=2, attempts_per_graph=4)
             parts = comm.allgather(list(zip(range(comm.rank, len(physical), comm.size), local, local_changes)))
             ordered = sorted(item for group in parts for item in group)
@@ -373,7 +511,11 @@ def run(config, folder, comm, device, *, allocation_seconds=3100, qualify=False,
             save(folder / 'original.pt', {'graphs': original, 'ids': seed_ids})
             save(folder / 'initial.pt', {'graphs': physical, 'changes': [r for _, _, r in ordered]})
     state['resume_count'] += 1
+    if synthetic.target_mode == 'solver':
+        synthetic.seed_targets = [{k: g[k].y.detach().clone() for k in ('bus', 'generator')} for g in physical]
     population = split['train'][~np.isin(split['train'], state['seed_ids'])]
+    if not set(state['seed_ids']) <= set(split['train'].tolist()):
+        raise ValueError('Initialization references must belong to the train split')
     val_ids = split['val'][:config['validation_samples']]
     if comm.rank == 0:
         write_json(folder / 'split.json', {'split_seed': 42, 'case': canonical_case(f"case{config['case']}"),
@@ -389,7 +531,7 @@ def run(config, folder, comm, device, *, allocation_seconds=3100, qualify=False,
         model = model_for(sample[0], config, 500 + comm.rank, torch.device('cpu'))
         try:
             result = check_derivatives(model, sample, real, {k: real[k].y for k in ('bus', 'generator')},
-                                       {'steps': 3, 'initial_rate': config['inner_rate'],
+                                       {'steps': 3, 'initial_rate': config['inner_rate'], 'target_mode': synthetic.target_mode,
                                         'rate_min': config['rate_min'], 'rate_max': config['rate_max']}, device)
         except Exception as exc:
             result = {'passed': False, 'loss_passed': False, 'gradients': [],
@@ -417,7 +559,7 @@ def run(config, folder, comm, device, *, allocation_seconds=3100, qualify=False,
         if not all(row['passed'] for row in qualification):
             raise RuntimeError('CPU/XPU second-order qualification failed')
         profile = []
-        for count in (16, 64, 256):
+        for count in config.get('profile_real_batches', (16, 64, 256)):
             optimizer.zero_grad(set_to_none=True)
             torch.xpu.reset_peak_memory_stats(device)
             tick = time.monotonic()
@@ -444,7 +586,7 @@ def run(config, folder, comm, device, *, allocation_seconds=3100, qualify=False,
         evaluation_started = time.monotonic()
         result, student = panel(synthetic, config, dataset, val_ids, comm, device)
         if result['mean'] is None:
-            raise FloatingPointError('Initial schedule fails held-out initialization panel; lower the starting rate')
+            raise FloatingPointError('Initial schedule has nonfinite validation loss; lower the starting rate')
         state['best_validation'], state['best_iteration'] = result['mean'], state['iteration']
         if comm.rank == 0:
             log(folder / 'history.jsonl', {'stage': 'initial_validation', 'metrics': result,
@@ -462,43 +604,18 @@ def run(config, folder, comm, device, *, allocation_seconds=3100, qualify=False,
             break
         tick = time.monotonic()
         iteration = state['iteration']
-        ids = sampler_ids(population, iteration, comm.rank, comm.size, config['real_batch'])
+        ids = sampler_ids(population, iteration, comm.rank, comm.size, config['real_batch'],
+                          seed=config.get('sampler_seed', 20261010))
         real = graph_batch(dataset, ids)
-        model = model_for(physical[0], config, 1_000_000 + iteration * comm.size + comm.rank, device)
+        model = model_for(physical[0], config, student_seed(config, iteration, comm.rank, comm.size), device)
         reference, grad_norm, rate_backtracks = training_gradient(model, synthetic, optimizer, real, comm)
-        before_state = deepcopy(synthetic.state_dict())
-        before_optimizer = deepcopy(optimizer.state_dict())
-        before_targets = deepcopy(synthetic.seed_targets)
-        optimizer.step()
-        proposal = deepcopy(synthetic.state_dict())
-        accepted, attempts = False, []
-        
-        for fraction in (1.0, 0.5, 0.25, 0.125, 0.0625):
-            synthetic.seed_targets = deepcopy(before_targets)
-            synthetic.load_state_dict({k: v + fraction * (proposal[k] - v) for k, v in before_state.items()})
+        def score():
             value = float(outer_loss(model, synthetic, real, create_graph=False).detach())
-            value = comm.allreduce(value, op=MPI.SUM) / comm.size
-            trial = {'fraction': fraction, 'real_mse': value if math.isfinite(value) else None, 'feasible': None}
-            if math.isfinite(value) and value <= reference:
-                ok, proposed_physical, proposed_checks = collective_audit(synthetic, comm)
-                trial['feasible'] = ok
-                if ok and config.get('fresh_solver_targets'):
-                    synthetic.seed_targets = [{k: g[k].y.detach().clone() for k in ('bus', 'generator')}
-                                              for g in proposed_physical]
-                    value = float(outer_loss(model, synthetic, real, create_graph=False).detach())
-                    value = comm.allreduce(value, op=MPI.SUM) / comm.size
-                    trial['relabelled_mse'] = value if math.isfinite(value) else None
-                    ok = math.isfinite(value) and value <= reference
-                if ok:
-                    physical, checks = proposed_physical, proposed_checks
-                    accepted = True
-            attempts.append(trial)
-            if accepted:
-                break
-        if not accepted:
-            synthetic.load_state_dict(before_state)
-            optimizer.load_state_dict(before_optimizer)
-            synthetic.seed_targets = before_targets
+            return comm.allreduce(value, op=MPI.SUM) / comm.size
+        accepted, proposed, rows, attempts = proposal_step(synthetic, optimizer, config, reference, score,
+                                                         lambda: collective_audit(synthetic, comm))
+        if accepted:
+            physical, checks = proposed, rows
         
         # A fully rejected proposal rolls back parameters AND all Adam state.
         state['accepted_updates' if accepted else 'rejected_updates'] += 1
@@ -517,7 +634,8 @@ def run(config, folder, comm, device, *, allocation_seconds=3100, qualify=False,
                 'real_mse_before': reference, 'accepted': accepted, 'attempts': attempts, 'meta_gradient_norm': grad_norm,
                 'seconds': seconds, 'active_seconds': state['active_seconds'],
                 'distinct_real_examples': len(state['seen_ids']), 'rates': synthetic.rates.detach().tolist(),
-                'rate_backtracks_for_new_initialization': rate_backtracks, 'topology': topology_event})
+                'rate_backtracks_for_new_initialization': rate_backtracks, 'topology': topology_event,
+                'grid_changes': changes_summary(synthetic)})
         do_eval = time.monotonic() - last_eval >= config['eval_seconds']
         do_eval = comm.bcast(do_eval if comm.rank == 0 else None, root=0)
         if do_eval:
@@ -527,7 +645,8 @@ def run(config, folder, comm, device, *, allocation_seconds=3100, qualify=False,
                 if comm.rank == 0:
                     export(folder, synthetic, config, state, physical, checks, student, name='best.pt')
             if comm.rank == 0:
-                log(folder / 'history.jsonl', {'stage': 'validation', 'iteration': state['iteration'], 'metrics': result})
+                log(folder / 'history.jsonl', {'stage': 'validation', 'iteration': state['iteration'],
+                                              'metrics': result, 'grid_changes': changes_summary(synthetic)})
             last_eval = time.monotonic()
         do_save = comm.bcast(time.monotonic() - last_save >= config['checkpoint_seconds'] if comm.rank == 0 else None, root=0)
         if do_save:
@@ -546,8 +665,9 @@ def run(config, folder, comm, device, *, allocation_seconds=3100, qualify=False,
         log(folder / 'history.jsonl', {'stage': 'final_validation', 'iteration': state['iteration'], 'metrics': result})
     comm.Barrier()
     if complete:
-        final_evaluation(folder, synthetic, original, config, dataset, split, state, comm, device)
-        state['status'] = 'COMPLETE'
+        done = final_evaluation(folder, synthetic, original, config, dataset, split, state, comm, device,
+                                deadline=started + allocation_seconds)
+        state['status'] = 'COMPLETE' if done else 'FINALIZING'
     checkpoint(folder, synthetic, optimizer, state, config, physical, checks, comm)
     return state
 
@@ -564,7 +684,8 @@ def topology_step(synthetic, optimizer, physical, checks, config, real, training
     edited, changes = generate_dataset(comm.rank + 1, [physical[i]],
         min_buses=config.get('bus_range', bus_limits(config['case']))[0],
         max_buses=config.get('bus_range', bus_limits(config['case']))[1],
-        seed=83_000 + iteration, max_edits=2, attempts_per_graph=3)
+        seed=83_000 + iteration, max_edits=config.get('topology_max_edits', 2),
+        attempts_per_graph=config.get('topology_attempts', 3))
 
     candidate = None
     local_score = float('inf')
@@ -592,10 +713,16 @@ def topology_step(synthetic, optimizer, physical, checks, config, real, training
     physical_proposal[index] = new_graph
     
     # check acceptance
-    accepted = math.isfinite(new_loss) and new_loss < old_loss and min(diversity(physical_proposal, config['batches'])) >= 3
+    required = min(config.get('min_topologies', 3), config['batch_size'])
+    accepted = math.isfinite(new_loss) and new_loss < old_loss and min(diversity(physical_proposal, config['batches'])) >= required
     if accepted:
         ok, new_physical, new_checks = collective_audit(proposed, comm)
         accepted = ok
+        if accepted and proposed.target_mode == 'solver':
+            proposed.seed_targets = [{k: g[k].y.detach().clone() for k in ('bus', 'generator')} for g in new_physical]
+            new_loss = float(outer_loss(training_model, proposed, real, create_graph=False).detach())
+            new_loss = comm.allreduce(new_loss, op=MPI.SUM) / comm.size
+            accepted = math.isfinite(new_loss) and new_loss < old_loss
     event = {'accepted': accepted,
              'graph': index,
              'before': old_loss,
@@ -607,9 +734,10 @@ def topology_step(synthetic, optimizer, physical, checks, config, real, training
     return synthetic, optimizer, physical, checks, event
 
 
-def replay_export(model, artifact, dataset, ids, batch_size):
+def fit_export(model, artifact):
+    """Apply the saved curriculum to the supplied starting weights and buffers."""
     theta = {k: p.detach().clone().requires_grad_(True) for k, p in model.named_parameters()}
-    buffers = dict(model.named_buffers())
+    buffers = {k: b.detach().clone() for k, b in model.named_buffers()}
     device = next(model.parameters()).device
     for step in artifact['schedule']:
         batch = step['inputs'].clone().to(device)
@@ -617,6 +745,12 @@ def replay_export(model, artifact, dataset, ids, batch_size):
         grad = torch.autograd.grad(loss, tuple(theta.values()), allow_unused=True)
         theta = {k: (p if g is None else p - step['rate'] * g).detach().requires_grad_(True)
                  for (k, p), g in zip(theta.items(), grad)}
+    return theta, buffers
+
+
+def replay_export(model, artifact, dataset, ids, batch_size):
+    theta, buffers = fit_export(model, artifact)
+    device = next(model.parameters()).device
     total = 0.0
     with torch.no_grad():
         for start in range(0, len(ids), batch_size):
@@ -626,51 +760,113 @@ def replay_export(model, artifact, dataset, ids, batch_size):
     return total / len(ids)
 
 
-def final_evaluation(folder, synthetic, original, config, dataset, split, state, comm, device):
-    # Fresh model seeds AND a disjoint validation subset; test remains untouched.
+def final_evaluation(folder, synthetic, original, config, dataset, split, state, comm, device, deadline=float('inf')):
+    """Paired held-out evaluation and train-only real-control tuning; resumable by arm."""
     ids = split['val'][config['validation_samples']:config['validation_samples'] + config['final_samples']]
     artifact = torch.load(folder / 'best.pt', weights_only=False, map_location='cpu')
-    model = model_for(original[0], config, 20_000_000 + comm.rank, device)
-    value = replay_export(model, artifact, dataset, ids, config['eval_batch'])
-    values = comm.allgather(value)
-    report = {'best_distilled': score_summary(values)}
+    best = None
+    if 'synthetic_state' in artifact:
+        best = Schedule(artifact['anchor_graphs'], config)
+        best.seed_targets = artifact['seed_targets']
+        best.load_state_dict(artifact['synthetic_state'])
+    path = folder / 'evaluation.partial.json'
+    report = json.loads(path.read_text()) if path.exists() else {}
+    if report and report['best_iteration'] != artifact['training_state']['best_iteration']:
+        raise ValueError('Partial evaluation belongs to a different best artifact')
+    report['best_iteration'] = artifact['training_state']['best_iteration']
+    def persist():
+        if comm.rank == 0:
+            write_json(path, report)
+        comm.Barrier()
+    def have_time():
+        return all(comm.allgather(deadline - time.monotonic() > config.get('evaluation_reserve_seconds', 90)))
+
+    if 'best_distilled' not in report:
+        if not have_time():
+            return False
+        if best is not None:
+            report['best_distilled'], _ = panel(best, config, dataset, ids, comm, device, seed_base=20_000_000)
+        else:
+            model = model_for(original[0], config, 20_000_000 + comm.rank, device)
+            report['best_distilled'] = score_summary(comm.allgather(replay_export(model, artifact, dataset, ids, config['eval_batch'])))
+        persist()
+
+    # A separate real-only LR sweep prevents DD's rate schedule handicapping the control.
+    population = split['train'][~np.isin(split['train'], state['seed_ids'])]
+    calibration_ids = sampler_ids(population, 0, 0, 1, config.get('calibration_samples', 128), seed=314159)
+    tuning = report.setdefault('real_control_tuning', {'training_ids': calibration_ids, 'candidates': []})
+    for rate in config.get('real_control_rates', []):
+        if any(row['rate'] == rate for row in tuning['candidates']):
+            continue
+        if not have_time():
+            persist()
+            return False
+        candidate = Schedule(original, config | {'inner_rate': rate, 'target_mode': 'frozen'})
+        metrics, _ = panel(candidate, config | {'trace_every': 0}, dataset, calibration_ids, comm, device, seed_base=30_000_000)
+        tuning['candidates'].append(dict(rate=rate, **metrics))
+        persist()
     controls = [('real_subset_initial_rates', Schedule(original, config)),
                 ('real_subset_learned_rates', Schedule(original, config)),
                 ('initial_topology_learned_rates', Schedule(torch.load(folder / 'initial.pt', weights_only=False)['graphs'], config))]
+    finite = [r for r in tuning['candidates'] if r['mean'] is not None]
+    if finite:
+        tuning['chosen_rate'] = min(finite, key=lambda r: r['mean'])['rate']
+        controls.append(('real_subset_tuned_rates', Schedule(original, config | {'inner_rate': tuning['chosen_rate'], 'target_mode': 'frozen'})))
     learned_rates = torch.tensor([step['rate'] for step in artifact['schedule']], dtype=torch.float64)
-    
-    # loop
     for name, control in controls:
+        if name in report:
+            continue
+        if not have_time():
+            return False
         if 'learned_rates' in name:
             probability = (learned_rates - control.rate_min) / (control.rate_max - control.rate_min)
             with torch.no_grad():
                 control.rate_logits.copy_(torch.logit(probability))
         result, _ = panel(control, config, dataset, ids, comm, device, seed_base=20_000_000)
         report[name] = result
-    
-    # build report
-    report['untrained'], _ = panel(synthetic, config, dataset, ids, comm, device, seed_base=20_000_000, trained=False)
+        persist()
+    if config.get('initialization') == 'fixed' and best is not None:
+        # Fixed-initialization success is not a claim about fresh initializations.
+        for name, control in [('best_distilled_unseen', best)] + [
+                ('real_subset_tuned_unseen', c) for n, c in controls if n == 'real_subset_tuned_rates']:
+            if name not in report:
+                if not have_time():
+                    return False
+                report[name], _ = panel(control, config | {'initialization': 'random'}, dataset, ids, comm, device, seed_base=20_000_000)
+                persist()
+    baseline = 'pretrained_baseline' if config.get('initialization') == 'pretrained' else 'untrained'
+    if baseline not in report:
+        if not have_time():
+            return False
+        report[baseline], _ = panel(synthetic, config, dataset, ids, comm, device, seed_base=20_000_000, trained=False)
     report.update({'validation_ids': ids.tolist(), 'test_accessed': False, 'case': config['case'], 'model': config['model'],
-                   'best_iteration': state['best_iteration'], 'outer_updates': state['iteration'],
+                   'outer_updates': state['iteration'], 'initialization': config.get('initialization', 'random'),
+                   'target_mode': synthetic.target_mode, 'student_updates': synthetic.steps * synthetic.passes,
                    'distinct_real_training_examples': len(state['seen_ids']),
                    'distinct_real_examples_at_best': len(artifact['training_state']['seen_ids']),
                    'synthetic_count': config['synthetic_count'],
                    'bus_limits': config.get('bus_range', bus_limits(config['case'])),
                    'batches': batch_report(artifact['physical_solved_graphs'], config['batches']).to_dict(orient='records')})
+    if config.get('initialization') == 'pretrained':
+        report['pretrained'] = config['pretrained']
+    if config.get('common_evaluation', False):
+        from distillation.synthetic.evaluation import compare_export
+        common = compare_export(folder, artifact, original, config, dataset, split, comm, device, deadline)
+        if common is None:
+            persist()
+            return False
+        report['common_evaluation'] = common
     if comm.rank == 0:
         write_json(folder / 'evaluation.json', report)
+    persist()
+    return True
 
 
 def default_config(case, model):
-    batches, batch_size, passes = {'GAT': (3, 30, 1), 'GIN': (4, 25, 1), 'HeteroGNN': (5, 20, 1)}[model]
-    return {'case': case, 'model': model, 'model_options': model_options(model),
-            'batches': batches, 'batch_size': batch_size, 'passes': passes, 'synthetic_count': batches * batch_size,
-            'strength': 0.02, 'target_strength': 0.02, 'inner_rate': 1e-6, 'rate_min': 1e-8, 'rate_max': 1e-3,
-            'outer_rate': 0.03, 'data_seed': 42, 'split_seed': 42, 'real_batch': 64, 'eval_batch': 128,
-            'validation_samples': 256, 'final_samples': 1024, 'training_seconds': 2400,
-            'max_updates': 1000, 'topology_every': 20, 'checkpoint_seconds': 120, 'eval_seconds': 300,
-            'reserve_seconds': 240, 'raw_root': str(DATA_ROOT / 'raw/OPFData/dataset_release_1'),
-            'data_root': str(DATA_ROOT / 'processed/T1')}
+    return common_config(case) | dict(model=model, model_options=model_options(model, width=128, layers=3),
+        passes=10, target_strength=0., inner_rate=1e-6, rate_min=1e-10, rate_max=1e-2,
+        outer_rate=.03, outer_target_rate=.003, topology_every=0, common_evaluation=True,
+        real_control_rates=[1e-8, 1e-7, 1e-6, 1e-5, 1e-4, 1e-3])
 
 
 def main():
@@ -726,7 +922,8 @@ def main():
                 'torch': str(torch.__version__), 'numpy': np.__version__, 'world_size': world.size,
                 'node_world_size': comm.size, 'mpi': MPI.Get_library_version(),
                 'source_sha256': {str(p): hashlib.sha256(p.read_bytes()).hexdigest() for p in sources},
-                'method': 'full second-order Wang DD; mean over independent initializations; solver-gated topology search'})
+                'method': 'full second-order Wang DD; mean over real minibatches; solver-gated topology search',
+                'initialization': config.get('initialization', 'random')})
         
         # Only node leader locks; collective communication remains within its node.
         lock = claim(folder / 'run.lock') if comm.rank == 0 else None
