@@ -12,47 +12,44 @@ import time
 import numpy as np
 import torch
 
-from distillation.DC.campaign import calibrate, panel
+from distillation.synthetic.evaluation import calibrate, panel, controls, evaluate_controls
 from distillation.conversion.matrix_form import mat2opf
-from distillation.synthetic import describe, teaching_targets
-from distillation.synthetic.experiments import initialize
-from distillation.synthetic.inputs import SyntheticInputs, feasible_step
+from distillation.synthetic import describe
+from distillation.synthetic.experiments import initialize, common_config, validate_condensation
+from distillation.synthetic.inputs import SyntheticInputs, feasible_step, optimizer_for, changes_summary
+from distillation.synthetic.learning import model_options
 from distillation.synthetic.runtime import (averaged_gradients,
                                             collective_audit,
+                                            collectively,
                                             graph_batch,
                                             log,
                                             sampler_ids,
                                             save)
 from distillation.training.T1_single_topo.common import write_json
-from distillation.training.T1_single_topo.data import CaseDataset
+from distillation.experiments.staging import case_dataset as CaseDataset
 from experiments.lumina_bench.models import SUPPORTED_MODELS
 from .hmdc import (alignment_step,
                    data_gradients,
                    model_step)
 from .models import (build_pair,
-                     model_config)
+                     model_config,
+                     pretrained_pair_config)
 from .selection import select_real
 
-FORMAT = 'hmdc-opf-v1'
+FORMAT = 'hmdc-opf-v2'
 
 
-def collectively(comm, function):
-    """Every rank reaches the same failure boundary before subsequent collectives."""
-    value, error = None, None
-    try:
-        value = function()
-    except Exception as exc:
-        error = f'{type(exc).__name__}: {exc}'
-    
-    # share local failures before any rank enters the next collective
-    errors = comm.allgather(error)
-    if any(errors):
-        raise RuntimeError(f'HMDC collective failure: {errors}')
-    
-    return value
+def default_config(case, pair=('GIN', 'GAT'), *, evaluation_models=None):
+    names = list(evaluation_models or pair)
+    return common_config(case) | dict(pair=list(pair), evaluation_models=names,
+        models={k: model_options(k, width=128, layers=3) for k in names},
+        data_rate=.005, restart_rounds=100, real_steps=2, query_interval=10,
+        candidate_pool=256, alignment_rate=.01, mutual=True, balanced=True, balance_interval=10,
+        mutual_rate_factor=.1)
 
 
 def validate_config(config):
+    validate_condensation(config)
     pair = config['pair']
     if len(pair) != 2 or len(set(pair)) != 2 or any(k not in SUPPORTED_MODELS for k in pair):
         raise ValueError('Select two distinct supported benchmark models')
@@ -80,7 +77,7 @@ def qualify_device(graphs, config, real, comm, device):
         # compare identical seeded pairs on CPU and accelerator, including input grads
         for target in ('cpu', device):
             pair = build_pair(graphs[0], config, rates, 500+comm.rank, target)
-            synthetic = SyntheticInputs(graphs[:3], config['strength'])
+            synthetic = SyntheticInputs(graphs[:3], config['strength'], target_mode=config.get('target_mode', 'solver'))
             info = data_gradients(pair.models, pair.alignment, pair.balance, synthetic, real,
                                   mutual=config.get('mutual', True), balanced=config.get('balanced', True))
             families = {}
@@ -129,7 +126,7 @@ def export(path, synthetic, config, state, physical, checks, students):
     save(path, dict(format=FORMAT, config=config, training_state=deepcopy(state), inputs=batch,
                     teaching_targets=labels, physical_solved_graphs=physical, solver_checks=checks,
                     model_checkpoints=students, student_rates=state['rates'],
-                    target_semantics='fresh detached AC-OPF labels',
+                    **synthetic.snapshot(),
                     generation_statistics=[describe(g) for g in physical]))
 
 
@@ -154,10 +151,11 @@ def checkpoint(folder, synthetic, optimizer, config, state, physical, checks, pa
 
 
 def restore(payload):
-    synthetic = SyntheticInputs(payload['anchor_graphs'], payload['config']['strength'])
+    synthetic = SyntheticInputs(payload['anchor_graphs'], payload['config']['strength'],
+                                target_mode=payload['config'].get('target_mode', 'solver'))
     synthetic.load_state_dict(payload['synthetic_state'])
     synthetic.labels = deepcopy(payload['labels'])
-    optimizer = torch.optim.SGD(synthetic.parameters(), lr=payload['config']['data_rate'], momentum=.5)
+    optimizer = optimizer_for(synthetic, payload['config'])
     optimizer.load_state_dict(payload['optimizer'])
     
     return synthetic, optimizer
@@ -168,11 +166,15 @@ def run(config, folder, comm, device, *, allocation_seconds=3300, qualify=False,
     from mpi4py import MPI
     
     validate_config(config)
+    config = collectively(comm, lambda: pretrained_pair_config(config, refresh=True))
     folder, started = Path(folder), time.monotonic()
     folder.mkdir(parents=True, exist_ok=True)
     def load_existing():
-        if (folder/'config.json').exists() and json.loads((folder/'config.json').read_text()) != config:
-            raise ValueError('Output directory already belongs to another configuration')
+        if (folder/'config.json').exists():
+            saved_config = json.loads((folder/'config.json').read_text())
+            if saved_config != config:
+                changed = [k for k in saved_config.keys() | config.keys() if saved_config.get(k) != config.get(k)]
+                raise ValueError(f'Output directory already belongs to another configuration ({changed})')
         if not (folder/'latest.pt').exists():
             return None
         value = torch.load(folder/'latest.pt', weights_only=False, map_location='cpu')
@@ -203,12 +205,12 @@ def run(config, folder, comm, device, *, allocation_seconds=3300, qualify=False,
                 state['best_validation'], state['best_iteration'] = best['best_validation'], best['best_iteration']
     else:
         original, ids, physical, _ = initialize(config, folder, comm)
-        synthetic = SyntheticInputs(physical, config['strength'])
-        optimizer = torch.optim.SGD(synthetic.parameters(), lr=config['data_rate'], momentum=.5)
+        synthetic = SyntheticInputs(physical, config['strength'], target_mode=config.get('target_mode', 'solver'))
+        optimizer = optimizer_for(synthetic, config)
         ok, physical, checks = collective_audit(synthetic, comm)
         if not ok:
             raise RuntimeError('Initial HMDC inputs failed AC-OPF feasibility recheck')
-        synthetic.labels = teaching_targets(physical)
+        synthetic.refresh_labels(physical)
         state = dict(iteration=0, active_seconds=0., accepted_updates=0, rejected_updates=0,
                      seed_ids=ids, seen_matching_ids=set(), seen_training_ids=set(), seen_candidate_ids=set(),
                      rates={}, training_rates={}, best_validation=None, best_iteration=None,
@@ -250,6 +252,12 @@ def run(config, folder, comm, device, *, allocation_seconds=3300, qualify=False,
     
     if not state['training_rates']:
         state['training_rates'] = {k:state['rates'][k]*config.get('mutual_rate_factor',1.) for k in config['pair']}
+    if state.get('evaluation_ready', False):
+        finished=final_evaluation(folder,original,config,state,dataset,split,comm,device,
+                                  deadline=started+allocation_seconds)
+        state['status']='COMPLETE' if finished else 'FINALIZING'
+        checkpoint(folder,synthetic,optimizer,config,state,physical,checks,pair,comm)
+        return state
     if state['best_validation'] is None:
         results, students = selection_panel(synthetic,config,state['rates'],dataset,val_ids,comm,device)
         if any(r['mean'] is None for r in results.values()):
@@ -272,15 +280,15 @@ def run(config, folder, comm, device, *, allocation_seconds=3300, qualify=False,
             break
         tick, iteration = time.monotonic(), state['iteration']
         if pair is None:
-            seed = 1_000_000+(iteration//config['restart_rounds'])*comm.size+comm.rank
+            seed = config.get('training_model_seed',1_000_000)+(iteration//config['restart_rounds'])*comm.size+comm.rank
             pair = collectively(comm,lambda: build_pair(original[0],config,state['training_rates'],seed,device))
         candidates = []
         query,owner,refresh=query_schedule(iteration,config['restart_rounds'],config['query_interval'])
         if not pair.query_ids or refresh:
             candidates = sampler_ids(population,query,comm.rank,comm.size,
-                                     config['candidate_pool'],seed=51_001)
+                                     config['candidate_pool'],seed=config.get('query_seed',51_001))
             pair.query_ids = collectively(comm,lambda: select_real(pair.models[owner],dataset,candidates,
-                config['real_batch'],batch_size=config['eval_batch'],seed=61_001+iteration*comm.size+comm.rank))
+                config['real_batch'],batch_size=config['eval_batch'],seed=config.get('query_selection_seed',61_001)+iteration*comm.size+comm.rank))
         real = collectively(comm,lambda: graph_batch(dataset,pair.query_ids))
         optimizer.zero_grad(set_to_none=True)
         info = collectively(comm,lambda: data_gradients(pair.models,pair.alignment,pair.balance,synthetic,real,
@@ -296,14 +304,14 @@ def run(config, folder, comm, device, *, allocation_seconds=3300, qualify=False,
             statistics = []
             for step in range(config['real_steps']):
                 ids = sampler_ids(population,iteration*config['real_steps']+step,comm.rank,comm.size,
-                                  config['real_batch'],seed=71_001)
+                                  config['real_batch'],seed=config.get('real_training_seed',71_001))
                 batch = graph_batch(dataset,ids);training_ids.extend(ids)
                 statistics.append(model_step(pair.models,pair.alignment,pair.optimizers,batch,
                                               mutual=config.get('mutual',True)))
             if config.get('mutual',True):
                 for step in range(config['real_steps']):
                     ids = sampler_ids(population,iteration*config['real_steps']+step,comm.rank,comm.size,
-                                      config['real_batch'],seed=81_001)
+                                      config['real_batch'],seed=config.get('alignment_seed',81_001))
                     training_ids.extend(ids)
                     alignment_step(pair.models,pair.alignment,pair.alignment_optimizer,graph_batch(dataset,ids))
             return statistics
@@ -319,7 +327,7 @@ def run(config, folder, comm, device, *, allocation_seconds=3300, qualify=False,
         rows = comm.allgather(dict(matching=info,training=train_info))
         if comm.rank==0:
             log(folder/'history.jsonl',dict(stage='matching',iteration=state['iteration'],workers=rows,
-                data_gradient_norm=norm,accepted=accepted,attempts=attempts,active_seconds=state['active_seconds']))
+                data_gradient_norm=norm,changes=changes_summary(synthetic),accepted=accepted,attempts=attempts,active_seconds=state['active_seconds']))
         if comm.bcast(time.monotonic()-last_eval >= config['eval_seconds'] if comm.rank==0 else None,root=0):
             results,students=selection_panel(synthetic,config,state['rates'],dataset,val_ids,comm,device)
             score=selection_score(results,state['selection_baseline'])
@@ -343,37 +351,42 @@ def run(config, folder, comm, device, *, allocation_seconds=3300, qualify=False,
         if comm.rank==0:export(folder/'best.pt',synthetic,config,state,physical,checks,students)
     if comm.rank==0:export(folder/'condensed.pt',synthetic,config,state,physical,checks,students)
     comm.Barrier()
-    final_evaluation(folder,original,config,state,dataset,split,comm,device)
-    state['status']='COMPLETE'
+    state['evaluation_ready']=True
+    checkpoint(folder,synthetic,optimizer,config,state,physical,checks,pair,comm)
+    finished=final_evaluation(folder,original,config,state,dataset,split,comm,device, deadline=started+allocation_seconds)
+    state['status']='COMPLETE' if finished else 'FINALIZING'
     checkpoint(folder,synthetic,optimizer,config,state,physical,checks,pair,comm)
     return state
 
 
-def final_evaluation(folder, original, config, state, dataset, split, comm, device):
-    # Use a disjoint validation panel for final comparisons, leaving the test split untouched
+def final_evaluation(folder, original, config, state, dataset, split, comm, device, deadline=float('inf')):
     ids=split['val'][config['validation_samples']:config['validation_samples']+config['final_samples']]
-    best=torch.load(folder/'best.pt',weights_only=False,map_location='cpu')['physical_solved_graphs']
+    best=torch.load(folder/'best.pt',weights_only=False,map_location='cpu')
+    last=torch.load(folder/'condensed.pt',weights_only=False,map_location='cpu')
     initial=torch.load(folder/'initial.pt',weights_only=False,map_location='cpu')['graphs']
-    variants=dict(best=best,initial_synthetic=initial,random_real=original,untrained=original)
-    previous=collectively(comm,lambda: (json.loads((folder/'evaluation.json').read_text())
-        if (folder/'evaluation.json').exists() else {}) if comm.rank==0 else None)
-    previous=comm.bcast(previous,root=0)
-    
-    # current results
-    results=previous.get('results',{}) if previous.get('best_iteration')==state['best_iteration'] else {}
+    variants=controls(best,initial,original,config,last=SyntheticInputs.from_export(last))
+    path=folder/'evaluation.partial.json'
+    previous=json.loads(path.read_text()) if path.exists() else {}
+    if previous and previous['best_iteration'] != state['best_iteration']:
+        raise ValueError('Partial evaluation belongs to a different best dataset')
+    results=previous.get('results', {})
+    report=dict(results=results, validation_ids=ids.tolist(), test_accessed=False,
+        pair=config['pair'], held_out_models=[k for k in config['evaluation_models'] if k not in config['pair']],
+        best_iteration=state['best_iteration'], initialization=config.get('initialization','random'),
+        pretrained=config.get('pretrained'), target_mode=config.get('target_mode','solver'),
+        synthetic_count=config['synthetic_count'], student_updates=config['batches']*config['evaluation_epochs'],
+        matching_updates=state['iteration'], active_seconds=state['active_seconds'],
+        distinct_real_training_examples=len(state['seen_matching_ids'] | state['seen_training_ids']),
+        distinct_real_candidates=len(state['seen_candidate_ids']),
+        note='Paired starting weights and shuffle seeds; ordinary SGD without mutual distillation; unseen means new random weights')
     for kind in config['evaluation_models']:
-        cached=kind in results and (folder/f'student_{kind}.pt').exists() if comm.rank==0 else None
-        if comm.bcast(cached,root=0):
-            continue
-        results[kind]={}
-        for name,graphs in variants.items():
-            result,student=panel(SyntheticInputs(graphs,config['strength']),model_config(config,kind),
-                state['rates'][kind],dataset,ids,comm,device,seed_base=20_000_000,trained=name!='untrained')
-            results[kind][name]=result
-            if comm.rank==0 and name=='best':save(folder/f'student_{kind}.pt',student)
-        if comm.rank==0:
-            write_json(folder/'evaluation.json',dict(results=results,validation_ids=ids.tolist(),test_accessed=False,
-                pair=config['pair'],held_out_models=[k for k in config['evaluation_models'] if k not in config['pair']],
-                best_iteration=state['best_iteration'],
-                complete=len(results)==len(config['evaluation_models']),
-                note='Fresh ordinary-SGD evaluation; no mutual distillation during downstream training'))
+        def persist(arms):
+            results[kind]=arms
+            if comm.rank==0: write_json(path,report)
+            comm.Barrier()
+        results[kind], complete=evaluate_controls(variants,model_config(config,kind),state['rates'][kind],
+            dataset,ids,comm,device,results=results.get(kind,{}),persist=persist,
+            student_path=folder/f'student_{kind}.pt',deadline=deadline)
+        if not complete: return False
+    if comm.rank==0: write_json(folder/'evaluation.json',report | {'complete':True})
+    return True

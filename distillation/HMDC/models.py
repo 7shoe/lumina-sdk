@@ -5,19 +5,53 @@ import torch
 
 from distillation.synthetic.learning import (benchmark_batch,
                                              model_for,
-                                             model_options)
+                                             model_options,
+                                             pretrained_config,
+                                             clear_pretrained_cache,
+                                             validate_initialization)
 from .features import SpatialSemanticAlignment, forward_features
 from .hmdc import GradientBalance
 
 
 def model_config(config, kind):
-    return dict(model=kind, model_options=config.get('models', {}).get(kind, model_options(kind)),
+    result = config | dict(model=kind, model_options=config.get('models', {}).get(kind, model_options(kind)),
                 model_precision='float64', strength=config['strength'],
                 batch_size=config['batch_size'], eval_batch=config['eval_batch'],
                 evaluation_epochs=config['evaluation_epochs'],
                 student_rates=config['student_rates'],
                 calibration_panels=config.get('calibration_panels', 2),
                 student_rate_factor=config.get('student_rate_factor', .1))
+    result.update(initialization=config.get('initialization', 'random'),
+                  model_seed=config.get('model_seed', 1_000_000))
+    result.pop('pretrained', None)
+    if config.get('initialization') == 'pretrained':
+        path = config.get('pretrained_checkpoints', {}).get(kind)
+        if not path:
+            raise ValueError(f'Missing pretrained_checkpoints entry for {kind}')
+        result['pretrained_checkpoint'] = path
+        if kind in config.get('pretrained', {}):
+            result['pretrained'] = config['pretrained'][kind]
+    return pretrained_config(result)
+
+
+def pretrained_pair_config(config, *, refresh=False):
+    """Pin one checkpoint per evaluated architecture; never silently mix regimes."""
+    if refresh:
+        clear_pretrained_cache()
+    if config.get('pretrained_checkpoint'):
+        raise ValueError('HMDC requires pretrained_checkpoints, keyed by model name')
+    if config.get('initialization') != 'pretrained':
+        validate_initialization(config)
+        if config.get('pretrained_checkpoints'):
+            raise ValueError('Set initialization=pretrained to use pretrained_checkpoints')
+        return config
+    names = config.get('evaluation_models', config['pair'])
+    if set(config.get('pretrained_checkpoints', {})) != set(names):
+        raise ValueError('pretrained_checkpoints must cover exactly evaluation_models, including both pair members')
+    resolved = {kind: model_config(config, kind) for kind in names}
+    return config | {'models': config.get('models', {}) | {k: c['model_options'] for k, c in resolved.items()},
+                     'pretrained_checkpoints': {k: c['pretrained_checkpoint'] for k, c in resolved.items()},
+                     'pretrained': {k: c['pretrained'] for k, c in resolved.items()}}
 
 
 def cpu_state(module):
@@ -73,8 +107,10 @@ def build_pair(graph, config, rates, seed, device):
     names = config['pair']
     if len(names) != 2 or len(set(names)) != 2:
         raise ValueError('Choose two different Lumina benchmark architectures')
+    if config.get('initialization') == 'fixed':
+        seed = config.get('model_seed', 1_000_000)
     
-    # hand each architecture a distinct reproducible init seed
+    # Random students get distinct seeds; pretrained students reset to their own checkpoint.
     models = [model_for(graph, model_config(config, kind), seed + index * 100_000, device)
               for index, kind in enumerate(names)]
     
@@ -94,4 +130,3 @@ def build_pair(graph, config, rates, seed, device):
                 GradientBalance(3 if config.get('mutual', True) else 2, config.get('balance_interval', 10)),
                 [torch.optim.SGD(m.parameters(), lr=rates[name]) for m, name in zip(models, names)],
                 alignment_optimizer, [])
-

@@ -94,10 +94,9 @@ class GradientBalance:
 
 def normalize_data_gradients(synthetic, epsilon=1e-6):
     """Reference image/channel max normalization, per graph/physical family here."""
-    for edit in synthetic.edits:
-        for parameter in edit.parameters():
-            if parameter.grad is not None and parameter.numel():
-                parameter.grad.div_(parameter.grad.abs().max() + epsilon)
+    for parameter in synthetic.parameters():
+        if parameter.grad is not None and parameter.numel():
+            parameter.grad.div_(parameter.grad.abs().max() + epsilon)
 
 
 def data_gradients(models, alignment, balance, synthetic, real, *, mutual=True, balanced=True):
