@@ -3,6 +3,12 @@
 Authors: Ignasi Ventura Nadal, Samuel Chevalier
 Year: 2024
 
+For joint experiments with DD/DCGM/HMDC, use the shared
+[YAML and launch guide](../experiments/configs/README.md). RAMBO generates once per
+case/load-domain/seed; fresh or pretrained students use the common evaluation.
+Verified physical labels are preserved in reusable `dataset.pt` exports on Lustre.
+The standalone generator and its original artifacts remain available.
+
 #### Reproducibility
 We reimplement RAMBO for OPFData graphs, fixed dataset splits and resumable runs. The bilevel structure, relaxed KKT conditions and final AC-OPF solve follow the paper, with explicit adaptations from the [reference code](https://github.com/SamChevalier/RAMBO/tree/10952cf812bbd378c3e54fc84abf82806a02660a).
 

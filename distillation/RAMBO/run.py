@@ -15,7 +15,7 @@ from distillation.training.T1_single_topo.common import (ROOT,
                                                          digest,
                                                          file_hash,
                                                          write_json)
-from distillation.training.T1_single_topo.data import CaseDataset
+from distillation.experiments.staging import case_dataset as CaseDataset
 from distillation.training.T1_single_topo.state import (Stop,
                                                         save_torch)
 

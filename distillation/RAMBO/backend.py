@@ -70,7 +70,12 @@ class JuliaBackend:
                 self.process.wait(timeout=5)
             except subprocess.TimeoutExpired:
                 os.killpg(self.process.pid, signal.SIGKILL)
-                self.process.wait(timeout=5)
+                try:
+                    self.process.wait(timeout=5)
+                except subprocess.TimeoutExpired:
+                    # Lustre I/O can delay even a killed worker's exit. Reap it
+                    # later without turning a saved pause into a solver failure.
+                    threading.Thread(target=self.process.wait, daemon=True).start()
         self.thread.join(timeout=2)
 
     def __enter__(self):

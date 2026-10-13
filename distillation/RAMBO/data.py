@@ -1,5 +1,6 @@
 """Nominal-load anchoring and lossless exchange with the Julia backend."""
 from collections import Counter
+from copy import deepcopy
 from dataclasses import replace
 from pathlib import Path
 import json
@@ -9,6 +10,7 @@ import numpy as np
 
 import torch
 from torch_geometric.data import HeteroData
+from distillation.experiments.staging import local_path, signature
 
 from distillation.conversion.matrix_form import (mat2opf,
                                                  opf2mat,
@@ -64,13 +66,21 @@ def native_input(grid):
     return graph
 
 
+_TEMPLATES = {}
+
+
 def prepare_template(dataset, case_path, raw_root):
     """Use only a training input for schema; anchor loads to the pinned nominal case."""
     splits = dataset.splits(42)
     source_id = int(splits['train'][0])
     case = dataset.manifest['case']
     group = source_id // dataset.manifest['group_size']
-    archive_path = Path(raw_root) / f'{case}_{group}.tar.gz'
+    archive_path = local_path(Path(raw_root) / f'{case}_{group}.tar.gz')
+    split_hashes = {k: ids_hash(v) for k, v in splits.items()}
+    cache_key = (digest(dataset.manifest), digest(split_hashes), str(Path(case_path).resolve()),
+                 signature(case_path), str(archive_path), signature(archive_path))
+    if cache_key in _TEMPLATES:
+        return deepcopy(_TEMPLATES[cache_key])
     
     # verify that the native template comes from the recorded source archive
     raw_hash = file_hash(archive_path)
@@ -114,9 +124,12 @@ def prepare_template(dataset, case_path, raw_root):
     validate_network(p)
     graph = mat2opf(replace(mats, params=p, sol=None), include_solution=False)
     provenance = dict(data_identity=digest(dataset.manifest), template_train_id=source_id,
-                      split_hashes={k: ids_hash(v) for k, v in splits.items()},
+                      split_hashes=split_hashes,
                       raw_sha256=raw_hash, nominal_case_sha256=file_hash(case_path),
                       nominal_case=str(Path(case_path).resolve()))
+    if len(_TEMPLATES) >= 8:
+        _TEMPLATES.pop(next(iter(_TEMPLATES)))
+    _TEMPLATES[cache_key] = deepcopy((graph, provenance))
     return graph, provenance
 
 
