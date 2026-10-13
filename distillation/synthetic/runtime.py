@@ -13,6 +13,19 @@ from distillation.synthetic import audit_networks
 from distillation.training.T1_single_topo.common import atomic_file
 
 
+def collectively(comm, function):
+    """All ranks reach the same failure boundary before subsequent collectives."""
+    value, error = None, None
+    try:
+        value = function()
+    except Exception as exc:
+        error = f'{type(exc).__name__}: {exc}'
+    errors = comm.allgather(error)
+    if any(errors):
+        raise RuntimeError(f'Collective failure: {errors}')
+    return value
+
+
 def save(path, payload):
     with atomic_file(path) as stream:
         torch.save(payload, stream)
@@ -97,4 +110,3 @@ def score_summary(scores):
             'std': float(np.std(normalized) * scale) if finite else None,
             'per_initialization': [x if math.isfinite(x) else None for x in scores],
             'nonfinite_initializations': sum(not math.isfinite(x) for x in scores)}
-

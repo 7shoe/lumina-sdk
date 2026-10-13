@@ -1,8 +1,13 @@
 """Differentiable SDK adapters and graph-balanced regression shared by DD/DCGM/HMDC."""
 from contextlib import redirect_stdout
+from copy import deepcopy
+from functools import lru_cache
+import hashlib
 import io
+from pathlib import Path
 
 import torch
+from distillation.experiments.staging import local_path
 from torch_geometric.data import Batch, HeteroData
 
 from distillation.conversion.matrix_form import (E_LINE,
@@ -123,7 +128,75 @@ def model_options(kind, width=32, layers=2):
     return dict(hidden_dim=width, num_layers=layers, dropout=0.0)
 
 
-def model_for(graph, config, seed, device):
+def validate_initialization(config):
+    mode = config.get('initialization', 'random')
+    if mode not in ('random', 'fixed', 'pretrained'):
+        raise ValueError('initialization must be random, fixed or pretrained')
+    if mode == 'pretrained' and not config.get('pretrained_checkpoint'):
+        raise ValueError('pretrained initialization requires pretrained_checkpoint')
+    if config.get('pretrained_checkpoint') and mode != 'pretrained':
+        raise ValueError('Set initialization=pretrained to use pretrained_checkpoint')
+
+
+def initialization_seed(config, seed):
+    """The construction seed; pretrained identity is additionally pinned by hash."""
+    return config.get('model_seed', 1_000_000) if config.get('initialization') in ('fixed', 'pretrained') else seed
+
+
+@lru_cache(maxsize=8)
+def _read_pretrained(path, mtime_ns, size):
+    """Cache CPU weights, never the pretraining optimizer or a mutable student."""
+    content = local_path(path).read_bytes()
+    payload = torch.load(io.BytesIO(content), map_location='cpu', weights_only=False)
+    spec = payload.get('specification', {})
+    if spec.get('format') not in ('lumina-t1-v1', 'lumina-t2-v1'):
+        raise ValueError('Expected a T1 or T2 best.pt, final.pt or last.pt checkpoint')
+    if spec.get('split_seed') != 42 or not isinstance(spec.get('model_options'), dict):
+        raise ValueError('Checkpoint must record model_options and the benchmark split_seed=42')
+    weights = payload.get('model', {})
+    if not weights or any(not isinstance(v, torch.Tensor) or not torch.isfinite(v).all() for v in weights.values()):
+        raise ValueError('Checkpoint has missing or nonfinite model weights/buffers')
+    metadata = {'sha256': hashlib.sha256(content).hexdigest(), 'specification': spec,
+                'samples': payload.get('samples', payload.get('state', {}).get('samples'))}
+    return weights, metadata
+
+
+def clear_pretrained_cache():
+    # Some filesystems give consecutive same-size writes identical mtime/ctime.
+    # Re-read source bytes at a run boundary before validating pinned identities.
+    _read_pretrained.cache_clear()
+
+
+def pretrained_config(config, *, refresh=False):
+    """Resolve saved architecture and checkpoint identity, preserving target data."""
+    validate_initialization(config)
+    if config.get('initialization') != 'pretrained':
+        return config
+    if refresh:
+        clear_pretrained_cache()
+    path = Path(config['pretrained_checkpoint']).expanduser().resolve()
+    stat = path.stat()
+    _, metadata = _read_pretrained(str(path), stat.st_mtime_ns, stat.st_size)
+    spec = metadata['specification']
+    if spec['model'] != config['model']:
+        raise ValueError(f'Checkpoint model {spec["model"]} does not match requested {config["model"]}')
+    if 'pretrained' in config and config['pretrained'] != metadata:
+        raise ValueError('Pretrained checkpoint changed; use the original weights or a new run directory')
+    return config | {'pretrained_checkpoint': str(path), 'pretrained': deepcopy(metadata),
+                     'model_options': deepcopy(spec['model_options']), 'model_seed': spec['seed']}
+
+
+def model_for(graph, config, seed, device, *, initial_state=None):
+    """Build an independent student; embedded states allow source-free replay."""
+    if initial_state is None:
+        config = pretrained_config(config)
+        if config.get('initialization') == 'pretrained':
+            path = Path(config['pretrained_checkpoint'])
+            stat = path.stat()
+            initial_state, metadata = _read_pretrained(str(path), stat.st_mtime_ns, stat.st_size)
+            if metadata != config['pretrained']:
+                raise ValueError('Pretrained checkpoint changed while loading')
+    seed = initialization_seed(config, seed)
     kind = config['model']
     with torch.random.fork_rng(devices=[]), redirect_stdout(io.StringIO()):
         torch.manual_seed(seed)
@@ -131,6 +204,57 @@ def model_for(graph, config, seed, device):
                             benchmark_graph(graph), torch.device('cpu'))
     if config.get('model_precision') == 'float64':
         model = PrecisionModel(model, torch.float64)
+    if initial_state is not None:
+        model.load_state_dict(initial_state, strict=True)
     return model.to(device).eval()
 
 
+def model_from_export(artifact, device, seed=None, *, model=None):
+    """Initialize DD/DCGM replay, or an explicitly named HMDC pair member."""
+    config = artifact['config']
+    if 'model_checkpoints' in artifact:
+        if model not in artifact['model_checkpoints']:
+            raise ValueError('Specify a model with an embedded HMDC checkpoint')
+        student = artifact['model_checkpoints'][model]
+        config = config | {'model': model, 'model_options': student['model_options'],
+                           'model_seed': student['seed']}
+    else:
+        student = artifact.get('model_checkpoint', {})
+    if seed is None:
+        seed = config.get('model_seed', 1_000_000)
+    elif config.get('initialization') == 'fixed':
+        config = config | {'initialization': 'random'}  # Explicit unseen-seed replay.
+    weights = student['initial_state'] if config.get('initialization') == 'pretrained' else None
+    return model_for(artifact['physical_solved_graphs'][0], config, seed, device, initial_state=weights)
+
+
+def train_student(model, optimizer, synthetic, *, epochs=1, batch_size=16, seed=42, observe=None):
+    """Ordinary SGD on detached inputs; no trajectory contributes to data gradients."""
+    rng = torch.Generator().manual_seed(seed)
+    device = next(model.parameters()).device
+    model.eval()  # No stochastic augmentation/dropout in this controlled comparison.
+    # Keep calibrated BatchNorm frozen in this adaptation's student training.
+    for module in model.modules():
+        if isinstance(module, torch.nn.modules.batchnorm._BatchNorm):
+            module.eval()
+    value, updates, presentations = None, 0, 0
+    if observe is not None:
+        observe(updates, presentations)
+    for _ in range(epochs):
+        order = torch.randperm(len(synthetic.anchors), generator=rng).tolist()
+        for start in range(0, len(order), batch_size):
+            batch, labels = synthetic.batch(order[start:start + batch_size], detached=True)
+            batch = batch.to(device)
+            optimizer.zero_grad(set_to_none=True)
+            loss = mse(model(batch), labels, batch)
+            loss.backward()
+            if not torch.isfinite(loss) or any(p.grad is not None and not torch.isfinite(p.grad).all()
+                                               for p in model.parameters()):
+                raise FloatingPointError('Nonfinite ordinary student SGD')
+            optimizer.step()
+            value = float(loss.detach())
+            updates += 1
+            presentations += batch.num_graphs
+            if observe is not None:
+                observe(updates, presentations)
+    return value
