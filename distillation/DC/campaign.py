@@ -5,7 +5,7 @@ calibration, held-out evaluation, solver workers, checkpoints and provenance.
 """
 from copy import deepcopy
 import hashlib
-import math
+import json
 from pathlib import Path
 import time
 
@@ -18,100 +18,38 @@ from distillation.DC.dcgm import (SyntheticInputs,
                                   train_student)
 from distillation.conversion.matrix_form import mat2opf
 
-from distillation.synthetic import describe, teaching_targets
-from distillation.synthetic.experiments import initialize
-from distillation.synthetic.learning import model_for, mse
+from distillation.synthetic import describe
+from distillation.synthetic.experiments import initialize, common_config, validate_condensation
+from distillation.synthetic import evaluation
+from distillation.synthetic.inputs import optimizer_for, changes_summary
+from distillation.synthetic.learning import model_for, model_options, pretrained_config
 from distillation.synthetic.runtime import (averaged_gradients,
                                             collective_audit,
+                                            collectively,
                                             graph_batch,
                                            log, sampler_ids,
                                            save,
-                                           score_summary)
+                                           )
 from distillation.training.T1_single_topo.common import write_json
-from distillation.training.T1_single_topo.data import CaseDataset
-from experiments.lumina_bench.metrics import sample_metrics
+from distillation.experiments.staging import case_dataset as CaseDataset
 
-FORMAT = 'dcgm-opf-v1'
+FORMAT = 'dcgm-opf-v2'
 
-def cpu_state(model):
-    return {k: v.detach().cpu().clone() for k, v in model.state_dict().items()}
-
-def evaluate(model, dataset, ids, batch_size):
-    """Graph-balanced MSE plus physical residuals on every requested real graph."""
-    device = next(model.parameters()).device
-    model.eval()
-    totals, count = {}, 0
-    with torch.no_grad():
-        for start in range(0, len(ids), batch_size):
-            batch = graph_batch(dataset, ids[start:start + batch_size]).to(device)
-            prediction = model(batch)
-            if any(not torch.isfinite(v).all() for v in prediction.values()):
-                raise FloatingPointError('Nonfinite evaluation predictions')
-            values = sample_metrics(prediction, batch)
-            values['graph_balanced_mse'] = (values['sdk_mse'] / 2)
-            for name in ('graph_balanced_mse', 'violation', 'balance_l2', 'thermal_l2', 'bounds_l2'):
-                totals[name] = totals.get(name, 0.) + float(values[name].sum())
-            count += batch.num_graphs
-    if not all(math.isfinite(v) for v in totals.values()):
-        raise FloatingPointError('Nonfinite aggregate evaluation metric')
-    return {k: v / count for k, v in totals.items()}
+# Re-export these helpers for existing callers; implementation is shared with HMDC/DD.
+cpu_state, evaluate = evaluation.cpu_state, evaluation.evaluate
 
 
-def panel(synthetic, config, rate, dataset, ids, comm, device, *, seed_base=10_000_000, trained=True):
-    model = model_for(mat2opf(synthetic.anchors[0]), config, seed_base + comm.rank, device)
-    initial = cpu_state(model)
-    error, fatal = '', False
-    try:
-        if trained:
-            train_student(model, torch.optim.SGD(model.parameters(), lr=rate), synthetic,
-                          epochs=config['evaluation_epochs'], batch_size=config['batch_size'],
-                          seed=seed_base + comm.rank)
-        metrics = evaluate(model, dataset, ids, config['eval_batch'])
-    except Exception as exc:
-        metrics, error = {}, str(exc)
-        fatal = not (isinstance(exc, FloatingPointError) or
-                     isinstance(exc, ValueError) and str(exc).startswith('Non-finite'))
-    records = comm.allgather(dict(metrics=metrics, error=error, fatal=fatal, seed=seed_base + comm.rank))
-    if any(r['fatal'] for r in records):
-        raise RuntimeError(f'Evaluation failed collectively: {records}')
-    scores = [r['metrics'].get('graph_balanced_mse', float('inf')) for r in records]
-    summary = score_summary(scores) | dict(per_initialization_metrics=records, real_examples=len(ids),
-                                           student_epochs=config['evaluation_epochs'] if trained else 0)
-    student = dict(initial_state=initial, trained_state=cpu_state(model), seed=seed_base + comm.rank,
-                   model=config['model'], model_options=config['model_options'])
-    return summary, student
+def panel(*args, **kwargs):
+    return evaluation.panel(*args, evaluate_fn=evaluate, model_fn=model_for, **kwargs)
 
 
-def calibrate(original, config, dataset, population, comm, device):
-    """Select one fixed student rate using training data and calibration-only seeds."""
-    synthetic = SyntheticInputs(original, config['strength'])
-    ids = sampler_ids(population, 0, 0, 1, 128, seed=91231)
-    records = []
-    for rate in config['student_rates']:
-        tick = time.monotonic()
-        samples = []
-        for index in range(config.get('calibration_panels', 1)):
-            result, _ = panel(synthetic, config, rate, dataset, ids, comm, device,
-                              seed_base=300_000 + index * comm.size)
-            samples.extend(result['per_initialization_metrics'])
-        result = score_summary([r['metrics'].get('graph_balanced_mse', float('inf')) for r in samples])
-        result.update(per_initialization_metrics=samples, real_examples=len(ids),
-                      student_epochs=config['evaluation_epochs'])
-        records.append(dict(rate=rate, seconds=time.monotonic()-tick, **result))
-        if comm.rank == 0:
-            print(f"Calibration rate={rate:g} mean={result['mean']} nonfinite={result['nonfinite_initializations']} seconds={records[-1]['seconds']:.2f}", flush=True)
-    finite = [r for r in records if r['mean'] is not None]
-    if not finite:
-        raise FloatingPointError('No student rate is finite for all calibration initializations')
-    best = min(finite, key=lambda r: r['mean'])['rate']
-    factor = config.get('student_rate_factor', 1.)
-    if not 0 < factor <= 1:
-        raise ValueError('student_rate_factor must be in (0, 1]')
-    chosen = best * factor
-    return chosen, dict(chosen_rate=chosen, best_calibration_rate=best, safety_factor=factor,
-                       calibration_initializations=comm.size * config.get('calibration_panels', 1),
-                       training_ids=ids, candidates=records,
-                       note='Fixed thereafter; train-only selection on real seed graphs, common across protocols')
+def calibrate(*args, **kwargs):
+    return evaluation.calibrate(*args, panel_fn=panel, **kwargs)
+
+
+def default_config(case, model):
+    return common_config(case) | dict(model=model, model_options=model_options(model, width=128, layers=3),
+        data_rate=.1, restart_rounds=11, student_epochs=1)
 
 
 def qualify_device(graphs, config, real, comm, device):
@@ -120,7 +58,7 @@ def qualify_device(graphs, config, real, comm, device):
         results = []
         for target in ('cpu', device):
             model = model_for(graphs[0], config, 500 + comm.rank, target)
-            synthetic = SyntheticInputs(graphs[:3], config['strength'])
+            synthetic = SyntheticInputs(graphs[:3], config['strength'], target_mode=config.get('target_mode', 'solver'))
             value, _ = data_gradients(model, synthetic, real)
             groups = {}
             for name, p in synthetic.named_parameters():
@@ -144,10 +82,11 @@ def payload_for(synthetic, optimizer, config, state, physical, checks, students)
 
 
 def restore(payload):
-    synthetic = SyntheticInputs(payload['anchor_graphs'], payload['config']['strength'])
+    synthetic = SyntheticInputs(payload['anchor_graphs'], payload['config']['strength'],
+                                target_mode=payload['config'].get('target_mode', 'solver'))
     synthetic.load_state_dict(payload['synthetic_state'])
     synthetic.labels = deepcopy(payload['labels'])
-    optimizer = torch.optim.SGD(synthetic.parameters(), lr=payload['config']['data_rate'], momentum=.5)
+    optimizer = optimizer_for(synthetic, payload['config'])
     optimizer.load_state_dict(payload['optimizer'])
     return synthetic, optimizer
 
@@ -167,22 +106,33 @@ def export(folder, name, synthetic, config, state, physical, checks, student):
     save(folder/name, dict(format=FORMAT, config=config, training_state=state, inputs=inputs,
                           teaching_targets=labels, physical_solved_graphs=physical, solver_checks=checks,
                           model_checkpoint=student, student_rate=state['student_rate'],
-                          target_semantics='fresh detached AC-OPF labels',
+                          **synthetic.snapshot(),
                           generation_statistics=[describe(g) for g in physical]))
 
 
 def run(config, folder, comm, device, *, allocation_seconds=3300, qualify=False, stop_after_updates=None):
     from mpi4py import MPI
+    validate_condensation(config)
+    if type(config['student_epochs']) is not int or config['student_epochs'] <= 0:
+        raise ValueError('student_epochs must be a positive integer')
+    config = collectively(comm, lambda: pretrained_config(config, refresh=True))
     folder, started = Path(folder), time.monotonic()
-    error, payload = None, None
-    if comm.rank == 0:
+    folder.mkdir(parents=True, exist_ok=True)
+    def load_existing():
+        if (folder/'config.json').exists():
+            saved_config = json.loads((folder/'config.json').read_text())
+            if saved_config != config:
+                changed = [k for k in saved_config.keys() | config.keys() if saved_config.get(k) != config.get(k)]
+                raise ValueError(f'Resume config or pretrained checkpoint differs ({changed}); use a new directory')
         if (folder/'latest.pt').exists():
             payload = torch.load(folder/'latest.pt', weights_only=False, map_location='cpu')
-            if payload['config'] != config: error = 'Resume config differs; use a new directory'
-        write_json(folder/'config.json', config)
-    error = comm.bcast(error, root=0)
-    if error: raise ValueError(error)
+            if payload['config'] != config or len(payload['students']) != comm.size:
+                raise ValueError('Resume requires identical configuration and replica count')
+            return payload
+    payload = collectively(comm, lambda: load_existing() if comm.rank == 0 else None)
     payload = comm.bcast(payload, root=0)
+    if comm.rank == 0:
+        write_json(folder/'config.json', config)
     if payload and payload['state']['status'] == 'COMPLETE': return payload['state']
     dataset = CaseDataset(config['data_root'], f"case{config['case']}")
     split = dataset.splits(42)
@@ -203,16 +153,20 @@ def run(config, folder, comm, device, *, allocation_seconds=3300, qualify=False,
             student_optimizer.load_state_dict(saved['optimizer'])
     else:
         original, seed_ids, physical, _ = initialize(config, folder, comm)
-        synthetic = SyntheticInputs(physical, config['strength'])
-        optimizer = torch.optim.SGD(synthetic.parameters(), lr=config['data_rate'], momentum=.5)
+        synthetic = SyntheticInputs(physical, config['strength'], target_mode=config.get('target_mode', 'solver'))
+        optimizer = optimizer_for(synthetic, config)
         ok, physical, checks = collective_audit(synthetic, comm)
         if not ok: raise RuntimeError('Initial synthetic inputs failed solver recheck')
-        synthetic.labels = teaching_targets(physical)
+        synthetic.refresh_labels(physical)
         state = dict(iteration=0, active_seconds=0., accepted_updates=0, rejected_updates=0,
                      seed_ids=seed_ids, seen_ids=set(), status='TRAINING', resume_count=0,
                      student_rate=None, best_validation=None, best_iteration=None)
     state['resume_count'] += 1
     state['status'] = 'TRAINING'
+    if not set(state['seed_ids']) <= set(split['train'].tolist()):
+        raise ValueError('Initialization references must belong to the training split')
+    if config['validation_samples'] + config['final_samples'] > len(split['val']):
+        raise ValueError('Selection and final validation panels do not fit the split')
     population = split['train'][~np.isin(split['train'], state['seed_ids'])]
     val_ids = split['val'][:config['validation_samples']]
     if comm.rank == 0:
@@ -228,6 +182,12 @@ def run(config, folder, comm, device, *, allocation_seconds=3300, qualify=False,
         state['student_rate'], calibration = calibrate(original, config, dataset, population, comm, device)
         if comm.rank == 0: write_json(folder/'calibration.json', calibration)
     rate = state['student_rate']
+    if state.get('evaluation_ready', False):
+        finished = final_evaluation(folder, synthetic, original, config, state, dataset, split, comm, device,
+                                    deadline=started+allocation_seconds)
+        state['status'] = 'COMPLETE' if finished else 'FINALIZING'
+        checkpoint(folder, synthetic, optimizer, config, state, physical, checks, model, student_optimizer, comm)
+        return state
     if state['best_validation'] is None:
         result, student = panel(synthetic, config, rate, dataset, val_ids, comm, device)
         if result['mean'] is None: raise FloatingPointError('Initial synthetic evaluation nonfinite')
@@ -244,10 +204,10 @@ def run(config, folder, comm, device, *, allocation_seconds=3300, qualify=False,
         if stop_after_updates is not None and this_run >= stop_after_updates: break
         tick, iteration = time.monotonic(), state['iteration']
         if model is None:
-            seed = 1_000_000 + (iteration//config['restart_rounds'])*comm.size + comm.rank
+            seed = config.get('training_model_seed', 1_000_000) + (iteration//config['restart_rounds'])*comm.size + comm.rank
             model = model_for(original[0], config, seed, device)
             student_optimizer = torch.optim.SGD(model.parameters(), lr=rate)
-        ids = sampler_ids(population, iteration, comm.rank, comm.size, config['real_batch'])
+        ids = sampler_ids(population, iteration, comm.rank, comm.size, config['real_batch'], seed=config.get('sampler_seed', 20261010))
         real = graph_batch(dataset, ids)
         optimizer.zero_grad(set_to_none=True)
         failure = None
@@ -278,7 +238,7 @@ def run(config, folder, comm, device, *, allocation_seconds=3300, qualify=False,
         if comm.rank == 0:
             log(folder/'history.jsonl', dict(stage='matching', iteration=state['iteration'],
                 matching_loss=float(np.mean([r['matching_loss'] for r in rows])), data_gradient_norm=norm,
-                accepted=accepted, attempts=attempts, active_seconds=state['active_seconds'],
+                changes=changes_summary(synthetic), accepted=accepted, attempts=attempts, active_seconds=state['active_seconds'],
                 distinct_real_examples=len(state['seen_ids']), workers=rows))
         if comm.bcast(time.monotonic()-last_eval >= config['eval_seconds'] if comm.rank == 0 else None, root=0):
             result, student = panel(synthetic, config, rate, dataset, val_ids, comm, device)
@@ -300,24 +260,39 @@ def run(config, folder, comm, device, *, allocation_seconds=3300, qualify=False,
     if comm.rank == 0: export(folder, 'condensed.pt', synthetic, config, state, physical, checks, student)
     comm.Barrier()
     if complete:
-        final_evaluation(folder, synthetic, original, config, state, dataset, split, comm, device)
-        state['status'] = 'COMPLETE'
+        state['evaluation_ready'] = True  # Freeze selected exports across evaluation-only resumptions.
+        checkpoint(folder, synthetic, optimizer, config, state, physical, checks, model, student_optimizer, comm)
+        finished = final_evaluation(folder, synthetic, original, config, state, dataset, split, comm, device,
+                                    deadline=started+allocation_seconds)
+        state['status'] = 'COMPLETE' if finished else 'FINALIZING'
     checkpoint(folder, synthetic, optimizer, config, state, physical, checks, model, student_optimizer, comm)
     return state
 
 
-def final_evaluation(folder, synthetic, original, config, state, dataset, split, comm, device):
+def final_evaluation(folder, synthetic, original, config, state, dataset, split, comm, device, deadline=float('inf')):
     ids = split['val'][config['validation_samples']:config['validation_samples']+config['final_samples']]
     best = torch.load(folder/'best.pt', weights_only=False, map_location='cpu')
     initial = torch.load(folder/'initial.pt', weights_only=False, map_location='cpu')['graphs']
-    variants = dict(best=best['physical_solved_graphs'], last=None, initial_synthetic=initial, random_real=original,
-                    untrained=original)
-    results = {}
-    for name, graphs in variants.items():
-        teaching = synthetic if graphs is None else SyntheticInputs(graphs, config['strength'])
-        results[name], student = panel(teaching, config, state['student_rate'], dataset, ids, comm, device,
-                                       seed_base=20_000_000, trained=name != 'untrained')
-        if comm.rank == 0 and name == 'best': save(folder/'student.pt', student)
-    if comm.rank == 0:
-        write_json(folder/'evaluation.json', dict(results=results, validation_ids=ids.tolist(), test_accessed=False,
-            note='12 fresh student initializations; one synthesized set per condition; equal ordinary SGD budgets'))
+    path = folder/'evaluation.partial.json'
+    previous = json.loads(path.read_text()) if path.exists() else {}
+    if previous and previous['best_iteration'] != best['training_state']['best_iteration']:
+        raise ValueError('Partial evaluation belongs to a different best dataset')
+    report = dict(results=previous.get('results', {}), validation_ids=ids.tolist(), test_accessed=False,
+        best_iteration=best['training_state']['best_iteration'], initialization=config.get('initialization', 'random'),
+        pretrained=config.get('pretrained'), target_mode=synthetic.target_mode,
+        synthetic_count=len(synthetic.anchors), student_updates=config['batches']*config['evaluation_epochs'],
+        matching_updates=state['iteration'], active_seconds=state['active_seconds'],
+        distinct_real_training_examples=len(state['seen_ids']),
+        distinct_real_examples_at_best=len(best['training_state']['seen_ids']),
+        note='Paired starting weights and shuffle seeds; equal ordinary SGD budgets; unseen means new random weights')
+    def persist(results):
+        report['results'] = results
+        if comm.rank == 0: write_json(path, report)
+        comm.Barrier()
+    report['results'], complete = evaluation.evaluate_controls(
+        evaluation.controls(best, initial, original, config, last=synthetic), config, state['student_rate'],
+        dataset, ids, comm, device, results=report['results'], persist=persist,
+        student_path=folder/'student.pt', deadline=deadline)
+    if complete and comm.rank == 0:
+        write_json(folder/'evaluation.json', report | {'complete': True})
+    return complete

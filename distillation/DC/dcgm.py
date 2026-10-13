@@ -2,13 +2,13 @@
 
 Reference: Zhao, Mopuri & Bilen (ICLR 2021), row-wise cosine distance, synthetic
 SGD with momentum, ordinary detached student SGD, repeated random restarts.
-The OPF solver gate and refreshed stop-gradient labels are explicit adaptations.
+Solver-gated inputs and shared solver/frozen/learned targets are explicit adaptations.
 """
 import torch
 from torch import nn
 
 from distillation.synthetic.inputs import SyntheticInputs, feasible_step, solve_inputs
-from distillation.synthetic.learning import mse
+from distillation.synthetic.learning import mse, train_student
 
 
 
@@ -77,30 +77,3 @@ def data_gradients(model, synthetic, real):
     if not torch.isfinite(loss) or any(not torch.isfinite(p.grad).all() for p in parameters):
         raise FloatingPointError('Nonfinite matching loss or synthetic gradient')
     return float(loss.detach()), diagnostics
-
-
-
-def train_student(model, optimizer, synthetic, *, epochs=1, batch_size=16, seed=42):
-    """Ordinary SGD on detached inputs; no trajectory contributes to data gradients."""
-    rng = torch.Generator().manual_seed(seed)
-    device = next(model.parameters()).device
-    model.eval()  # No stochastic augmentation/dropout in this controlled comparison.
-    # Keep calibrated BatchNorm frozen in this adaptation's student training.
-    for module in model.modules():
-        if isinstance(module, nn.modules.batchnorm._BatchNorm):
-            module.eval()
-    value = None
-    for _ in range(epochs):
-        order = torch.randperm(len(synthetic.anchors), generator=rng).tolist()
-        for start in range(0, len(order), batch_size):
-            batch, labels = synthetic.batch(order[start:start + batch_size], detached=True)
-            batch = batch.to(device)
-            optimizer.zero_grad(set_to_none=True)
-            loss = mse(model(batch), labels, batch)
-            loss.backward()
-            if not torch.isfinite(loss) or any(p.grad is not None and not torch.isfinite(p.grad).all()
-                                               for p in model.parameters()):
-                raise FloatingPointError('Nonfinite ordinary student SGD')
-            optimizer.step()
-            value = float(loss.detach())
-    return value

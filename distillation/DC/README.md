@@ -1,10 +1,39 @@
 # Dataset condensation with gradient matching for AC-OPF
 
+New experiments use `campaign.default_config(case, model)`: **100 grids, batches
+of 10, 100 downstream SGD updates, width 128 / three layers, FP64 and ±10%
+operational ranges**. All eight benchmark models and `random`/`fixed`/`pretrained`
+initialization are supported. Eleven matching rounds with one synthetic epoch
+between rounds span 100 student updates before restarting. This restart schedule
+is separate from the total condensation-update budget.
+
+Target modes are `solver` (refresh OPF labels), `frozen` (retain initial labels),
+and `learned` (optimize independent targets, `target_rate`). Every mode keeps
+solver-verified inputs; frozen/learned targets need not solve those inputs.
+Learned targets are an explicit extension of the paper. Cosine matching, detached
+real gradients, ordinary student SGD and feasibility-only acceptance remain.
+Exports preserve actual teaching targets, physical solutions and resume state;
+use `distillation.synthetic.evaluation.fit_export` for exact replay. Learning
+curves, physical/target drift and unseen-seed fixed-mode controls are recorded.
+Shared settings and launch preparation are in [synthetic](../synthetic/README.md)
+and [comparison.py](../experiments/comparison.py). The 48-grid study below records
+the earlier configurations and results.
+
 Status: DCGM core, notebook, resumable MPI runner and numerical tests implemented;
 the DD/DCGM protocol campaign is complete (61 conditions).
-The original plan and user decisions remain below. DD and DCGM share physical
-grid utilities; HMDC is deferred. Their objectives stay outside that utility. See
+The original plan and user decisions remain below. DD, DCGM and HMDC share physical
+grid and model-initialization utilities. Their objectives stay outside that utility. See
 [`../synthetic/README.md`](../synthetic/README.md).
+
+Pretrained adaptation uses `initialization: pretrained` and
+`pretrained_checkpoint: /path/to/T1-or-T2/final.pt`; `case` specifies the target
+case independently. Each student restart loads those weights, then ordinary
+synthetic-data training continues between matching rounds. Calibration and
+real-data controls use the same starting checkpoint. Its hash is checked on
+resume, initial weights are exported, and evaluation includes
+`pretrained_baseline`. This option changes initialization, preserving the
+gradient-matching objective, student schedule and solver-label policy.
+`random` remains the default; `fixed` resets to `model_seed`.
 
 ## Method and scope
 
@@ -13,7 +42,7 @@ and [`../mnist_mvp/dcgm.py`](../mnist_mvp/dcgm.py) to cases 30, 57 and 118, with
 separate GAT, GIN and HeteroGNN experiments. Compare protocols using matched
 splits, initialization pools and synthetic sample budgets. DD and DCGM retain
 their own training schedules and corresponding evaluation controls.
-Use fresh random model initializations and the existing seed-42 dataset split.
+The original campaign used fresh random initializations and the seed-42 dataset split.
 Keep validation and test examples out of synthesis.
 
 At the same current model weights, minimize
