@@ -21,6 +21,7 @@ import traceback
 import numpy as np
 import torch
 from torch.func import functional_call
+from torch.utils.checkpoint import checkpoint as recompute
 from torch_geometric.data import Batch
 from threadpoolctl import threadpool_limits
 
@@ -34,7 +35,9 @@ from distillation.DD.topology import (batch_report,
                                       generate_dataset)
 
 from distillation.conversion.matrix_form import mat2opf
+
 from distillation.solver import ACOPF
+
 from distillation.synthetic.learning import (model_for, model_from_export, model_options,
                                              pretrained_config, validate_initialization)
 from distillation.synthetic.runtime import collectively
@@ -58,6 +61,7 @@ def save(path, payload):
 
 
 def log(path, event):
+    """Logging of written JSONs"""
     event = {'utc': time.strftime('%Y-%m-%dT%H:%M:%SZ', time.gmtime()), **event}
     with Path(path).open('a') as stream:
         stream.write(json.dumps(event, allow_nan=False) + '\n')
@@ -66,6 +70,7 @@ def log(path, event):
 
 
 def validate_config(config):
+    """Check if input config is viable"""
     if config['model'] not in SUPPORTED_MODELS:
         raise ValueError(f'Unknown model: {config["model"]}')
     if any(type(config[k]) is not int or config[k] < 1 for k in ('batches', 'batch_size', 'passes')):
@@ -79,15 +84,25 @@ def validate_config(config):
         raise ValueError('Unknown target_mode')
     if config.get('topology_every') and config.get('target_mode') in ('frozen', 'learned'):
         raise ValueError('Online topology edits need target correspondence; use topology_every=0 for frozen/learned')
+    for key in ('checkpoint_inner', 'calibrate_inner_rate'):
+        if type(config.get(key, False)) is not bool:
+            raise ValueError(f'{key} must be boolean')
+    cap = config.get('inner_rate_cap')
+    if cap is not None and not config['rate_min'] < cap < config['rate_max']:
+        raise ValueError('inner_rate_cap must lie strictly between the rate bounds')
+    rate = config.get('outer_input_rate')
+    if rate is not None and (not math.isfinite(rate) or rate <= 0):
+        raise ValueError('outer_input_rate must be positive and finite')
 
 
 def student_seed(config, iteration, rank, world):
+    """Keep seed reproducible"""
     base = config.get('model_seed', 1_000_000)
     return base if config.get('initialization') in ('fixed', 'pretrained') else config.get('training_model_seed', base) + iteration * world + rank
 
 
 class Schedule(SyntheticOPF):
-    """Distinct K batches, E passes, and an independent learned rate per SGD step."""
+    """Data distillation runner ; distinct K batches (totalling M samples), E passes "epochs", and an independent learned rate per SGD step"""
     def __init__(self, graphs, config):
         super().__init__(graphs, steps=config['batches'], strength=config['strength'],
                          target_strength=config['target_strength'], initial_rate=config['inner_rate'],
@@ -95,6 +110,7 @@ class Schedule(SyntheticOPF):
                          target_mode=config.get('target_mode'),
                          learn_inputs=config.get('learn_inputs', True), learn_rates=config.get('learn_rates', True))
         self.passes = config['passes']
+        self.checkpoint_inner = config.get('checkpoint_inner', False)
         self.rate_logits = torch.nn.Parameter(self.rate_logits.detach().repeat(self.passes),
                                              requires_grad=self.rate_logits.requires_grad)
         # These benchmark backbones do not consume branch attributes. With
@@ -103,6 +119,13 @@ class Schedule(SyntheticOPF):
 
 
 def inner(model, synthetic, *, create_graph, observe=None):
+    """
+    Train closed model parameters on synthetic batches using the learned step SGD size
+    
+    Paras:
+    - create_graph=True: retains the mixed derivatives (how Wang '18 did it in the seminal paper)
+    """
+    
     device = next(model.parameters()).device
     theta = {name: p.detach().clone().requires_grad_(True) for name, p in model.named_parameters()}
     buffers = {name: p.detach().clone() for name, p in model.named_buffers()}
@@ -114,10 +137,17 @@ def inner(model, synthetic, *, create_graph, observe=None):
         observe(0, theta, buffers)
     for step in range(synthetic.steps * synthetic.passes):
         batch, target = batches[step % synthetic.steps]
-        loss = mse(functional_call(model, (theta, buffers), (batch,), strict=True), target, batch)
-        grad = torch.autograd.grad(loss, tuple(theta.values()), create_graph=create_graph, allow_unused=True)
-        theta = {key: p if g is None else p - rates[step] * g
-                 for (key, p), g in zip(theta.items(), grad)}
+        names = tuple(theta)
+        # Bind each batch now: backward recomputes this exact step, including its
+        # mixed derivatives. No trajectory truncation or detached data gradient.
+        def update(rate, *values, batch=batch, target=target):
+            parameters = dict(zip(names, values))
+            loss = mse(functional_call(model, (parameters, buffers), (batch,), strict=True), target, batch)
+            gradients = torch.autograd.grad(loss, values, create_graph=create_graph, allow_unused=True)
+            return tuple(p if g is None else p - rate * g for p, g in zip(values, gradients))
+        values = (recompute(update, rates[step], *theta.values(), use_reentrant=False)
+                  if create_graph and synthetic.checkpoint_inner else update(rates[step], *theta.values()))
+        theta = dict(zip(names, values))
         if not create_graph:
             theta = {key: p.detach().requires_grad_(True) for key, p in theta.items()}
         if observe is not None:
@@ -126,8 +156,16 @@ def inner(model, synthetic, *, create_graph, observe=None):
 
 
 def outer_loss(model, synthetic, real, *, create_graph):
+    """
+    For a fixed model, evakl on real-data MSE after adapting the model to synthetic data in the inner loop
+    """
+    
     theta, buffers = inner(model, synthetic, create_graph=create_graph)
+    
+    # copy model
     real = real.clone().to(next(model.parameters()).device)
+    
+    # call, infer, and compute MSE
     return mse(functional_call(model, (theta, buffers), (real,), strict=True),
                {kind: real[kind].y for kind in ('bus', 'generator')}, real)
 
@@ -178,9 +216,14 @@ def training_gradient(model, synthetic, optimizer, real, comm):
 
     This leaves the exact SGD inner trajectory intact (no gradient clipping).
     The same initialization/minibatch is retried; no difficult seed is discarded.
+    
+    
     """
     from mpi4py import MPI
-    for attempt in range(12):
+    
+    # max number of retries.
+    num_retries = 12
+    for attempt in range(num_retries):
         optimizer.zero_grad(set_to_none=True)
         loss = outer_loss(model, synthetic, real, create_graph=True)
         finite = comm.allreduce(math.isfinite(float(loss.detach())), op=MPI.LAND)
@@ -201,11 +244,16 @@ def training_gradient(model, synthetic, optimizer, real, comm):
             probability = (reduced - synthetic.rate_min) / (synthetic.rate_max - synthetic.rate_min)
             synthetic.rate_logits.copy_(torch.logit(probability))
         optimizer.state.pop(synthetic.rate_logits, None)
-    raise FloatingPointError('No finite meta-gradient after 12 inner-rate backtracks')
+    raise FloatingPointError(f'No finite meta-gradient after {num_retries} inner-rate backtracks')
 
 
 def collective_audit(synthetic, comm):
+    """
+    udit across MPI ranks and return overall success
+    """
     local = []
+    
+    # eval-only mode
     with torch.no_grad():
         for i in range(comm.rank, len(synthetic.anchors), comm.size):
             matrix = synthetic.edits[i](synthetic.anchors[i], synthetic.strength)
@@ -214,7 +262,9 @@ def collective_audit(synthetic, comm):
             row['sample'] = i
             graph = solutions[0].to_hetero(ACOPF(matrix)) if row['success'] else None
             local.append((i, row, graph))
+    # joint records
     records = sorted(item for group in comm.allgather(local) for item in group)
+    
     return all(row['success'] for _, row, _ in records), [g for _, _, g in records], [r for _, r, _ in records]
 
 
@@ -228,7 +278,8 @@ def optimizer_for(synthetic, config):
                              ('rate', [synthetic.rate_logits])):
         params = [p for p in parameters if p.requires_grad]
         if params:
-            groups.append(dict(params=params, lr=config.get(f'outer_{name}_rate', config['outer_rate'])))
+            rate = config.get(f'outer_{name}_rate')
+            groups.append(dict(params=params, lr=config['outer_rate'] if rate is None else rate))
     return torch.optim.Adam(groups)
 
 
@@ -523,6 +574,20 @@ def run(config, folder, comm, device, *, allocation_seconds=3100, qualify=False,
             'validation_ids': val_ids.tolist(), 'test_accessed': False,
             'train_pool_sha256': hashlib.sha256(population.tobytes()).hexdigest(),
             'sampler': 'cyclic independently shuffled epochs, iteration/rank cursor, seed 20261010'})
+    if config.get('calibrate_inner_rate') and 'initial_inner_rate' not in state:
+        from distillation.synthetic.evaluation import calibrate
+        rate, calibration = calibrate(original, config | {'evaluation_epochs': config['passes']},
+                                      dataset, population, comm, device)
+        rate = min(max(rate, synthetic.rate_min * 1.001), synthetic.rate_max * .999)
+        if config.get('inner_rate_cap') is not None:
+            rate = min(rate, config['inner_rate_cap'])
+        with torch.no_grad():
+            probability = (rate - synthetic.rate_min) / (synthetic.rate_max - synthetic.rate_min)
+            synthetic.rate_logits.fill_(math.log(probability / (1 - probability)))
+        state['initial_inner_rate'] = rate
+        if comm.rank == 0:
+            write_json(folder/'inner_calibration.json', calibration | {'native_initial_rate': rate,
+                'native_initial_rate_cap': config.get('inner_rate_cap')})
     if qualify:
         from distillation.DD.mvp import check_derivatives
         sample = physical[:3]
@@ -795,7 +860,8 @@ def final_evaluation(folder, synthetic, original, config, dataset, split, state,
     population = split['train'][~np.isin(split['train'], state['seed_ids'])]
     calibration_ids = sampler_ids(population, 0, 0, 1, config.get('calibration_samples', 128), seed=314159)
     tuning = report.setdefault('real_control_tuning', {'training_ids': calibration_ids, 'candidates': []})
-    for rate in config.get('real_control_rates', []):
+    for nominal_rate in config.get('real_control_rates', []):
+        rate = nominal_rate * config.get('student_rate_factor', 1.)
         if any(row['rate'] == rate for row in tuning['candidates']):
             continue
         if not have_time():
@@ -805,7 +871,8 @@ def final_evaluation(folder, synthetic, original, config, dataset, split, state,
         metrics, _ = panel(candidate, config | {'trace_every': 0}, dataset, calibration_ids, comm, device, seed_base=30_000_000)
         tuning['candidates'].append(dict(rate=rate, **metrics))
         persist()
-    controls = [('real_subset_initial_rates', Schedule(original, config)),
+    controls = [('real_subset_initial_rates', Schedule(original, config | {
+                    'inner_rate': state.get('initial_inner_rate', config['inner_rate'])})),
                 ('real_subset_learned_rates', Schedule(original, config)),
                 ('initial_topology_learned_rates', Schedule(torch.load(folder / 'initial.pt', weights_only=False)['graphs'], config))]
     finite = [r for r in tuning['candidates'] if r['mean'] is not None]
@@ -866,6 +933,7 @@ def default_config(case, model):
     return common_config(case) | dict(model=model, model_options=model_options(model, width=128, layers=3),
         passes=10, target_strength=0., inner_rate=1e-6, rate_min=1e-10, rate_max=1e-2,
         outer_rate=.03, outer_target_rate=.003, topology_every=0, common_evaluation=True,
+        checkpoint_inner=False, calibrate_inner_rate=False, inner_rate_cap=None, outer_input_rate=None,
         real_control_rates=[1e-8, 1e-7, 1e-6, 1e-5, 1e-4, 1e-3])
 
 

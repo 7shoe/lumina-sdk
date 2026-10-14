@@ -15,6 +15,11 @@ ordinary SGD and train-only calibration as DCGM, with learning curves and
 unseen-weight controls for fixed initialization. Actual teaching targets survive
 checkpointing and export; `synthetic.evaluation.fit_export` replays them.
 
+Large cases can use `STUDY_HMDC_MICROBATCH=8` for bounded activation memory.
+It accumulates full mean parameter gradients before matching, then recomputes
+chunks for input derivatives; the objective and GBM remain the same, apart from
+floating-point summation order. Student-training batches are unchanged.
+
 | File | Purpose |
 | --- | --- |
 | `campaign.py` | Distributed training, evaluation, checkpoints and resume |
