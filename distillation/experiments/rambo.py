@@ -49,7 +49,8 @@ def expand(spec, root, source_hashes, group, case_info):
     if not samplers or not set(samplers) <= {'rambo', 'uniform'}: raise ValueError('Unknown RAMBO sampler')
     rows = []
     for case, seed, domain, sampler in itertools.product(group['cases'], group['seeds'], domains, samplers):
-        if case not in (30, 57, 118): raise ValueError('RAMBO supports cases 30, 57 and 118')
+        if type(case) is not int or case not in (14, 30, 57, 118, 500):
+            raise ValueError('RAMBO supports cases 14, 30, 57, 118 and 500')
         defaults = common_config(case) | {'evaluation_reserve_seconds': 90}
         base = {k: defaults[k] for k in SHARED_FIELDS + EVALUATION_FIELDS}
         base.update({k: v for k, v in spec['shared'].items() if k in SHARED_FIELDS}, **spec['evaluation'])

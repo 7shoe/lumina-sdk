@@ -21,6 +21,7 @@ from distillation.training.T1_single_topo.state import (Stop,
 
 from .backend import JuliaBackend
 from .data import (attach_solution,
+                   export_dataset,
                    network_record,
                    prepare_template,
                    write_matpower)
@@ -36,13 +37,14 @@ def configuration(**updates):
     config.update(updates)
     config['case'] = canonical_case(config['case'])
     
-    # itersate atts
-    if config['case'] not in {f'pglib_opf_case{n}_ieee' for n in (30, 57, 118)}:
-        raise ValueError('Initial RAMBO qualification covers cases 30, 57, 118')
+    if not (Path(__file__).with_name('cases') / (config['case'] + '.m')).is_file():
+        raise ValueError('RAMBO requires a pinned nominal case (14, 30, 57, 118, 500)')
     if config['method'] not in ('rambo', 'uniform'):
         raise ValueError('method must be rambo or uniform')
     if config['warm_start'] not in ('opf', 'feasible'):
         raise ValueError('warm_start must be opf or feasible')
+    if config['max_attempts'] is None and type(config['count']) is int:
+        config['max_attempts'] = max(1000, 10 * config['count'])
     for key in ('count', 'history_size', 'variable_size', 'max_attempts'):
         if type(config[key]) is not int or config[key] <= 0:
             raise ValueError(f'{key} must be a positive integer')
@@ -121,6 +123,7 @@ def _run(config, output, stop, session_stages, backend_factory, dataset):
         completed = json.loads((output / 'complete.json').read_text())
         if completed['dataset_sha256'] != file_hash(output / 'dataset.json'):
             raise ValueError('Completed dataset manifest changed')
+        export_dataset(output)
         return completed
     casefile = output / 'case.m'
     write_matpower(template, casefile)
@@ -251,6 +254,7 @@ def _run(config, output, stop, session_stages, backend_factory, dataset):
             checkpoint('running')
     summary = checkpoint('complete')
     summary['dataset_sha256'] = file_hash(output / 'dataset.json')
+    export_dataset(output)
     write_json(output / 'complete.json', summary)
     return summary
 

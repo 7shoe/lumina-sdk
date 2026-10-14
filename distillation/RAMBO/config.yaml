@@ -14,4 +14,4 @@ tolerance: 0.000001
 duplicate_tolerance: 0.0000001 # Maximum difference divided by each load's allowed interval.
 stage_seconds: 150            # Ipopt CPU-time ceiling.
 request_seconds: 240          # Subprocess wall ceiling, including model construction.
-max_attempts: 1000            # Failed points never fill the requested dataset.
+max_attempts: null            # Auto: max(1000, 10 * count); failures never fill the dataset.

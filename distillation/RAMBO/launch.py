@@ -27,24 +27,31 @@ def freeze_source(destination):
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('root', type=Path)
-    parser.add_argument('--count', type=int, default=100)
+    parser.add_argument('--counts', '--count', dest='counts', type=int, nargs='+', default=[100, 800])
     parser.add_argument('--seeds', type=int, nargs='+', default=[42])
-    parser.add_argument('--cases', nargs='+', default=['case30', 'case57', 'case118'])
+    parser.add_argument('--cases', nargs='+', default=['case14', 'case30', 'case57', 'case118', 'case500'])
+    parser.add_argument('--samplers', nargs='+', choices=['rambo', 'uniform'], default=['rambo', 'uniform'])
+    parser.add_argument('--paper-bounds', action='store_true', help='Use [0.5, 2.0] instead of the OPFData envelope')
+    parser.add_argument('--max-attempts', type=int, help='Default: max(1000, 10 * count) per library')
     parser.add_argument('--qualify', action='store_true', help='Three-point generation plus restart and student checks')
     args = parser.parse_args()
+    args.root = args.root.expanduser().resolve()
     
     if (args.root / 'manifest.json').exists():
         raise FileExistsError('Use the existing PBS manifest to resume')
     
     experiments = []
+    domain, bounds = ('paper', [.5, 2.]) if args.paper_bounds else ('opfdata_envelope', [.8, 1.2])
     for case in args.cases:
-        for domain, bounds in (('opfdata_envelope', [.8, 1.2]), ('paper', [.5, 2.])):
+        for count in ([3] if args.qualify else args.counts):
             for seed in args.seeds:
-                for method in ('rambo', 'uniform'):
+                for method in args.samplers:
                     config = configuration(case=case, method=method, seed=seed, load_bounds=bounds,
-                                           count=3 if args.qualify else args.count)
-                    output = args.root / case / domain / method / f'seed{seed}'
+                                           count=count, max_attempts=args.max_attempts)
+                    output = args.root / config['case'] / domain / method / f'M{count}' / f'seed{seed}'
                     experiments.append(dict(config=config, output=str(output.resolve())))
+    if len({e['output'] for e in experiments}) != len(experiments):
+        raise ValueError('Cases, counts, seeds and samplers must be unique')
     
     freeze_source(args.root / 'source')
     

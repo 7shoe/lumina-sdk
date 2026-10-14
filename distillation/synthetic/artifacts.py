@@ -160,6 +160,8 @@ def train_from_artifact(path, *, device='cpu',model=None,initialization='recorde
     separate experiment. Hyperparameter overrides are recorded in provenance.
     """
     loaded=load_dataset(path);artifact=loaded['export'];config=artifact['config'].copy()
+    if 'model_checkpoint' not in artifact and not artifact.get('model_checkpoints'):
+        raise ValueError('Data-only artifact: use load_dataset with a separate downstream training protocol')
     students=artifact.get('model_checkpoints') or {config['model']:artifact['model_checkpoint']}
     kind=model or (next(iter(students)) if len(students)==1 else None)
     if kind not in students: raise ValueError('Choose a model recorded in recipe.json; use load_dataset for other architectures')

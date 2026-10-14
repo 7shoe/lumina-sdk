@@ -26,11 +26,13 @@ from distillation.solver.solution import Solution
 from distillation.solver.validate import feasibility
 
 from distillation.training.T1_single_topo.common import (digest,
-                                                         file_hash)
+                                                         file_hash,
+                                                         write_json)
+from distillation.training.T1_single_topo.state import save_torch
 
 
 def read_case(path):
-    """Read numeric MATPOWER matrices in the three pinned PGLib cases only.
+    """Read numeric MATPOWER matrices in the pinned PGLib cases only.
 
     This deliberately does not interpret MATLAB code. Julia/PowerModels parses
     the exported case independently before any labels are accepted.
@@ -97,10 +99,30 @@ def prepare_template(dataset, case_path, raw_root):
         raise ValueError(f'Missing training template {wanted}')
     mats = opf2mat(graph)
     nominal, actual = read_case(case_path), as_ppc(graph)[0]
+    # OPFData contains active equipment only. Preserve generator/cost alignment
+    # when removing the pinned case's disabled rows (53 generators in case500).
+    active_gen, active_branch = nominal['gen'][:, 7] > 0, nominal['branch'][:, 10] > 0
+    offline = dict(generators=int((~active_gen).sum()), branches=int((~active_branch).sum()))
+    nominal['gen'], nominal['gencost'] = nominal['gen'][active_gen], nominal['gencost'][active_gen]
+    nominal['branch'] = nominal['branch'][active_branch]
     if nominal['baseMVA'] != actual['baseMVA']:
         raise ValueError('Nominal and OPFData per-unit bases differ')
+    # OPFData/PowerModels relocates case500's reference from bus 311 (no
+    # generator) to 313. This changes the angle gauge, not the AC-OPF physics.
+    # Compare all other bus types strictly and KEEP OPFData's reference in graph.
+    references, types = {}, []
+    for name, ppc in (('opfdata', actual), ('nominal', nominal)):
+        kind = ppc['bus'][:, 1].copy()
+        ref = np.flatnonzero(kind == 3)
+        if len(ref) != 1:
+            raise ValueError('Nominal and OPFData cases must each have one reference bus')
+        references[name] = int(ppc['bus'][ref[0], 0])
+        generators = ppc['gen'][ppc['gen'][:, 7] > 0, 0]
+        kind[ref] = np.where(np.isin(ppc['bus'][ref, 0], generators), 2, 1)
+        types.append(kind)
+    np.testing.assert_array_equal(*types, err_msg='Nominal case mismatch: non-reference bus types')
     # Ignore setpoints, descriptive voltage levels, and demand; compare physics.
-    for key, columns in (('bus', [0, 1, 4, 5, 11, 12]),
+    for key, columns in (('bus', [0, 4, 5, 11, 12]),
                          ('gen', [0, 3, 4, 7, 8, 9]), ('gencost', list(range(7)))):
         np.testing.assert_allclose(actual[key][:, columns], nominal[key][:, columns], rtol=2e-6, atol=2e-6,
                                    err_msg=f'Nominal case mismatch: {key}')
@@ -126,7 +148,8 @@ def prepare_template(dataset, case_path, raw_root):
     provenance = dict(data_identity=digest(dataset.manifest), template_train_id=source_id,
                       split_hashes=split_hashes,
                       raw_sha256=raw_hash, nominal_case_sha256=file_hash(case_path),
-                      nominal_case=str(Path(case_path).resolve()))
+                      nominal_case=str(Path(case_path).resolve()), reference_buses=references,
+                      omitted_offline=offline)
     if len(_TEMPLATES) >= 8:
         _TEMPLATES.pop(next(iter(_TEMPLATES)))
     _TEMPLATES[cache_key] = deepcopy((graph, provenance))
@@ -180,6 +203,67 @@ def attach_solution(template, point, tolerance=1e-6):
     if not solution.success:
         raise ValueError(f'Independent AC-OPF verification failed: {solution.checks}')
     return solution.to_hetero(problem), solution.checks
+
+
+def export_dataset(folder):
+    """Publish a complete, model-independent library for the common dataset loader.
+
+    No student, validation selection, fitted normalization or new solve is needed.
+    Partial libraries remain available only through their native dataset.json.
+    """
+    folder = Path(folder)
+    generated = GeneratedDataset(folder / 'dataset.json')
+    manifest, config = generated.manifest, generated.manifest['config']
+    status = json.loads((folder / 'status.json').read_text())
+    if status['status'] != 'complete' or len(generated) != config['count']:
+        raise ValueError('Only an entire completed RAMBO library can be exported')
+    manifest_sha = file_hash(folder / 'dataset.json')
+    metadata_path = folder / 'artifact.json'
+    if metadata_path.exists():
+        metadata = json.loads(metadata_path.read_text())
+        if (metadata['source_generation']['sha256'] != manifest_sha or
+                metadata['sha256'] != file_hash(folder / 'dataset.pt')):
+            raise ValueError('Published RAMBO dataset changed')
+        return metadata
+    physical = list(generated)
+    checks = [r['checks'] | {'success': bool(r['checks']['feasible'])} for r in generated.records]
+    if not all(r['success'] for r in checks):
+        raise ValueError('Cannot export unverified AC-OPF labels')
+    identity = 'RAMBO-' + manifest['specification'][:16]
+    source = dict(id=identity, manifest=str((folder / 'dataset.json').resolve()),
+                  sha256=manifest_sha, statistics=status)
+    # Zero physical offsets; the shared loader applies the same SDK feature
+    # ordering as DD/DCGM/HMDC and restores these exact physical teaching targets.
+    export_config = config | dict(strength=.1, target_mode='solver', split_seed=42,
+                                  synthetic_count=len(generated), model_precision='float64')
+    save_torch(folder / 'dataset.pt', dict(format='rambo-opf-v1', config=export_config,
+        target_mode='solver', training_state=dict(status='COMPLETE'),
+        physical_solved_graphs=physical, solver_checks=checks,
+        teaching_targets={k: torch.cat([g[k].y for g in physical]) for k in ('bus', 'generator')},
+        generated_ids=[r['id'] for r in generated.records], source_generation=source))
+    sha = file_hash(folder / 'dataset.pt')
+    write_json(folder / 'recipe.json', dict(format='lumina-synthetic-recipe-v1', dataset_sha256=sha,
+        models={}, ordinary=None, native=None,
+        note='Data only: use load_dataset and a separately specified, matched downstream training protocol.'))
+    counts = [int(g['bus'].num_nodes) for g in physical]
+    metadata = dict(format='lumina-synthetic-dataset-v1', dataset_id=identity, generation_id=identity,
+        method='RAMBO', kind='generated_operating_points', status='COMPLETE', complete=True,
+        evaluation_complete=False, case=int(re.search(r'case(\d+)', config['case'])[1]),
+        count=len(generated), synthesis_models=[], evaluation_models=[], initialization=None,
+        generation_protocol=config['method'], load_bounds=config['load_bounds'], synthesis_seed=config['seed'],
+        target_mode='solver', target_semantics='verified final Julia/Ipopt AC-OPF solutions, preserved unchanged',
+        dataset='dataset.pt', sha256=sha, export_format='rambo-opf-v1', config='config.json',
+        recipe='recipe.json', resume='state.json', source_generation=source,
+        dataset_selection='entire completed generated library; no validation selection',
+        bus_counts=counts, bus_limits=[min(counts), max(counts)], physical_audit_passed=True,
+        feature_encoding='synthetic.learning.benchmark_graph; SDK OPF feature ordering',
+        targets={'bus': ['va (radians)', 'vm (per unit)'], 'generator': ['pg (per unit)', 'qg (per unit)']},
+        split=dict(split_seed=42, split_hashes=manifest['provenance'].get('split_hashes', {}),
+                   data_identity=manifest['provenance']['data_identity'],
+                   validation_accessed=False, test_accessed=False),
+        provenance=manifest['provenance'])
+    write_json(metadata_path, metadata)
+    return metadata
 
 
 def coverage(manifest, threshold=.01):

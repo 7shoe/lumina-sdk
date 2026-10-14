@@ -16,11 +16,39 @@ from distillation.RAMBO.aux.train import model_graph
 from distillation.conversion.matrix_form import mat2opf, opf2mat
 from distillation.selection import input_view
 from distillation.selection.generated import GeneratedDataset
+from distillation.synthetic import artifacts
+from distillation.synthetic.learning import benchmark_graph
 from distillation.solver import ACOPF, PyPowerSolver, Solution
 from distillation.test.test_dd_demo import cpu_threads, record, graph
 from distillation.training.T1_single_topo.common import digest, file_hash, write_json
 from distillation.training.T1_single_topo.state import save_torch
 from distillation.training.T1_single_topo.tests.test_t1 import assert_same
+
+
+@pytest.mark.parametrize('case', [14, 30, 57, 118, 500])
+@pytest.mark.parametrize('count', [100, 800])
+def test_pinned_cases_and_requested_cardinalities(case, count):
+    config = runner.configuration(case=f'case{case}', count=count)
+    nominal = data.read_case(Path(runner.__file__).with_name('cases') / (config['case'] + '.m'))
+    assert nominal['bus'].shape[0] == case
+    assert config['count'] == count and config['max_attempts'] == 10 * count
+    assert config['load_bounds'] == [.8, 1.2]
+    if case == 500:
+        assert config['case'] == 'pglib_opf_case500_goc'
+
+
+def test_cpu_manifest_separates_counts_and_keeps_opfdata_bounds(tmp_path, monkeypatch):
+    from distillation.RAMBO import launch
+    monkeypatch.setattr(launch, 'freeze_source', lambda path: None)
+    monkeypatch.setattr('sys.argv', ['launch', str(tmp_path), '--cases', 'case14', 'case500'])
+    launch.main()
+    rows = json.loads((tmp_path / 'manifest.json').read_text())['experiments']
+    assert len(rows) == 8 and len({r['output'] for r in rows}) == 8
+    assert {r['config']['count'] for r in rows} == {100, 800}
+    assert {r['config']['method'] for r in rows} == {'rambo', 'uniform'}
+    for row in rows:
+        assert row['config']['load_bounds'] == [.8, 1.2]
+        assert f"M{row['config']['count']}" in Path(row['output']).parts
 
 
 def test_distance_matches_log_l1_and_independent_subsets():
@@ -51,11 +79,26 @@ def test_native_input_has_no_labels_and_sign_aware_bounds(record):
     assert not runner.duplicate(almost, [point], net, 1e-7)
 
 
-def test_template_reads_exact_train_id_and_checks_archive(tmp_path, record, monkeypatch):
+@pytest.mark.parametrize('nominal_reference', [0, 1, 3])
+@pytest.mark.parametrize('offline', [False, True])
+def test_template_reads_exact_train_id_and_checks_archive(tmp_path, record, monkeypatch, nominal_reference, offline):
     case, index = 'pglib_opf_case30_ieee', 7
     graph = data.native_input(record['grid'])
     casefile = tmp_path / 'case.m'
-    data.write_matpower(graph, casefile)
+    nominal = graph.clone()
+    nominal['bus'].x[0, 1] = 2
+    nominal['bus'].x[nominal_reference, 1] = 3
+    data.write_matpower(nominal, casefile)
+    if offline:
+        tables = data.read_case(casefile)
+        text = casefile.read_text()
+        for key, status in (('gen', 7), ('gencost', None), ('branch', 10)):
+            row = tables[key][0].copy()
+            if status is not None:
+                row[status] = 0
+            text = text.replace(f'mpc.{key} = [\n', f'mpc.{key} = [\n' +
+                                ' '.join(f'{v:.17g}' for v in row) + ';\n')
+        casefile.write_text(text)
     archive_path = tmp_path / f'{case}_0.tar.gz'
     with tarfile.open(archive_path, 'w:gz') as archive:
         # Holdout records need not even contain valid JSON: they are not read.
@@ -73,6 +116,9 @@ def test_template_reads_exact_train_id_and_checks_archive(tmp_path, record, monk
             raise AssertionError('No cached labels needed')
     prepared, provenance = data.prepare_template(Dataset(), casefile, tmp_path)
     assert provenance['template_train_id'] == index
+    assert provenance['reference_buses'] == dict(opfdata=1, nominal=nominal_reference + 1)
+    assert provenance['omitted_offline'] == dict(generators=int(offline), branches=int(offline))
+    assert prepared['bus'].x[0, 1] == 3  # Preserve the benchmark's angle-label gauge.
     assert 'objective' not in prepared
     # Completed-library evaluations reuse the verified template without rescanning gzip.
     def no_read(*args, **kwargs):
@@ -85,6 +131,12 @@ def test_template_reads_exact_train_id_and_checks_archive(tmp_path, record, monk
         again['load'].x.zero_()
         unchanged, _ = data.prepare_template(Dataset(), casefile, tmp_path)
         torch.testing.assert_close(unchanged['load'].x, prepared['load'].x)
+    # A non-reference type change is still a mismatch, not a gauge relocation.
+    bad = nominal.clone()
+    bad['bus'].x[5, 1] = 2
+    data.write_matpower(bad, casefile)
+    with pytest.raises(AssertionError, match='non-reference bus types'):
+        data.prepare_template(Dataset(), casefile, tmp_path)
     Dataset.manifest['groups'][0]['raw_sha256'] = 'changed'
     with pytest.raises(ValueError, match='archive differs'):
         data.prepare_template(Dataset(), casefile, tmp_path)
@@ -147,6 +199,7 @@ def test_stage_resume_uses_final_labels_only(tmp_path, fake_backend, warm_start)
     config = runner.configuration(count=2, warm_start=warm_start)
     first = runner.run(config, tmp_path, backend_factory=fake_backend, dataset=object(), session_stages=2)
     assert first['status'] == 'paused' and first['accepted'] == 1
+    assert not (tmp_path / 'artifact.json').exists()
     stages_before = len(fake_backend.requests)
     result = runner.run(config, tmp_path, backend_factory=fake_backend, dataset=object())
     assert result['status'] == 'complete'
@@ -175,6 +228,40 @@ def test_failed_search_never_fills_budget_or_poison_library(tmp_path, fake_backe
     assert result['status'] == 'exhausted' and result['accepted'] == 1
     assert result['rejections'] == 2
     assert len(GeneratedDataset(tmp_path / 'dataset.json')) == 1
+    assert not (tmp_path / 'artifact.json').exists()
+    with pytest.raises(ValueError, match='entire completed'):
+        data.export_dataset(tmp_path)
+
+
+def test_data_only_export_preserves_targets_and_loads_without_generation_files(tmp_path, fake_backend):
+    config = runner.configuration(count=2)
+    assert runner.run(config, tmp_path, backend_factory=fake_backend, dataset=object())['status'] == 'complete'
+    loaded = artifacts.load_dataset(tmp_path)
+    meta = loaded['metadata']
+    assert meta['complete'] and not meta['evaluation_complete'] and meta['count'] == 2
+    assert meta['synthesis_models'] == meta['evaluation_models'] == []
+    assert not meta['split']['test_accessed'] and not meta['split']['validation_accessed']
+    for actual, physical in zip(loaded['graphs'], loaded['physical_solved_graphs']):
+        expected = benchmark_graph(physical, labels=True)
+        for kind in ('bus', 'generator'):
+            torch.testing.assert_close(actual[kind].y, physical[kind].y, rtol=0, atol=0)
+        for kind in actual.node_types:
+            torch.testing.assert_close(actual[kind].x, expected[kind].x, rtol=0, atol=0)
+        for edge in actual.edge_types:
+            torch.testing.assert_close(actual[edge].edge_index, expected[edge].edge_index, rtol=0, atol=0)
+            if 'edge_attr' in actual[edge]:
+                torch.testing.assert_close(actual[edge].edge_attr, expected[edge].edge_attr, rtol=0, atol=0)
+    assert len(set(loaded['export']['generated_ids'])) == 2
+    assert 'model_checkpoint' not in loaded['export']
+    (tmp_path / 'samples').rename(tmp_path / 'samples_moved')
+    (tmp_path / 'dataset.json').unlink()
+    assert len(artifacts.load_dataset(tmp_path)['graphs']) == 2
+    with pytest.raises(ValueError, match='Data-only artifact'):
+        artifacts.train_from_artifact(tmp_path)
+    with (tmp_path / 'dataset.pt').open('ab') as stream:
+        stream.write(b'changed')
+    with pytest.raises(ValueError, match='checksum'):
+        artifacts.load_dataset(tmp_path)
 
 
 def test_uniform_control_uses_only_ordinary_opf(tmp_path, fake_backend):

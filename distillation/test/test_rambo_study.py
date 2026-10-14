@@ -42,9 +42,29 @@ def test_rambo_axes_do_not_multiply_topology_or_target_modes(spec):
 
 def test_snapshot_contains_julia_environment_cases_and_rambo_defaults():
     files = study.source_files()
-    for name in ('config.yaml','julia/Project.toml','julia/Manifest.toml','julia/worker.jl','cases/pglib_opf_case30_ieee.m'):
+    for name in ('config.yaml','julia/Project.toml','julia/Manifest.toml','julia/worker.jl',
+                 'cases/pglib_opf_case30_ieee.m','cases/pglib_opf_case14_ieee.m','cases/pglib_opf_case500_goc.m'):
         assert 'distillation/RAMBO/'+name in files
     assert not any('/aux/' in name for name in files)
+
+
+@pytest.mark.parametrize('count', [100, 800])
+def test_new_cases_share_generation_across_evaluators_and_keep_count_in_identity(spec, tmp_path, count):
+    spec['methods'] = {'RAMBO': study.load()['methods']['RAMBO']}
+    spec['shared']['synthetic_count'] = count
+    group = spec['matrix'] | {'cases': [14, 500], 'initializations': ['random', 'fixed']}
+    rows = rambo.expand(spec, tmp_path, {'source': 'test'}, group,
+                        lambda case: dict(data_sha256=f'data{case}', reference_sha256=f'ref{case}'))
+    assert len(rows) == 24 and len({r['config']['generation_id'] for r in rows}) == 4
+    for row in rows:
+        cfg = row['config']
+        assert cfg['generator']['count'] == cfg['synthetic_count'] == count
+        assert cfg['split_seed'] == 42 and cfg['target_mode'] == 'solver'
+        assert cfg['bus_range'] == [cfg['case']] * 2
+    spec['shared']['synthetic_count'] = 800 if count == 100 else 100
+    other = rambo.expand(spec, tmp_path, {'source': 'test'}, group,
+                         lambda case: dict(data_sha256=f'data{case}', reference_sha256=f'ref{case}'))
+    assert not {r['config']['generation_id'] for r in rows} & {r['config']['generation_id'] for r in other}
 
 
 def test_delayed_julia_exit_does_not_invalidate_saved_pause(monkeypatch):
