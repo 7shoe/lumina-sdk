@@ -17,6 +17,77 @@ This directory contains experiment notes and PBS launchers for:
 - synthetic-data routines (DD, DC, HMDC);
 - training Lumina benchmark models on single or multiple topologies (T1, T2).
 
+## Full eight-model campaign (2026-10-13)
+
+[Configuration](configs/full256.yaml), profile `full`: **256 conditions**, one
+12-XPU node per condition, one synthesis seed (42), cases **14/30/57/118/500**.
+Submitted as PBS **8924450** on `debug-scaling`, 256 nodes / 3,072 XPUs, one hour.
+DD and DCGM cover GCN, GAT, GIN, Transformer, HGT, RGAT, HEAT and HeteroGNN.
+HMDC pairs are GAT+RGAT, Transformer+HGT, GCN+GIN, HeteroGNN+HGT and GIN+HEAT;
+each pair also evaluates two held-out architectures. RAMBO retains the pilot as
+its reference; this allocation is for condensation.
+
+| Condition | DD | DCGM | HMDC |
+| --- | ---: | ---: | ---: |
+| Conservative + learned, fresh and T1 adaptation, all cases | 80 | 80 | 50 |
+| Fixed-initialization ablation, GAT cases30/57 | 2 | 2 | 0 |
+| Solver-label controls | 9 | 9 | 6 |
+| Schedule/size comparisons | 6 | 6 | 6 |
+| **Total** | **97** | **97** | **62** |
+
+Adaptation source→target cases are 30→14, 14→30, 30→57, 57→118 and 118→500,
+using seed42 T1 checkpoints. Solver controls cover every model/pair for 30→57,
+plus fresh GAT and GIN+HEAT on case30. The reference remains **100 grids, batch10,
+10 epochs = 100 student updates**. HEAT/case30 fresh and GIN/case57 adaptation
+(HMDC: GIN+HEAT in both cases) additionally compare: 100 grids/300 updates;
+200 grids/100 updates; and 100 grids/batch25/100 updates. Real and initial-grid
+controls follow each condition's schedule. These are targeted comparisons, not HPO.
+
+Each condition gets 1,800 active synthesis seconds or 1,000 updates, with 120s
+checkpoints and a one-hour allocation. The real minibatch is 64 per XPU from the
+training split; validation selection uses 256 examples and final reporting 1,024
+different examples. Test data stay untouched. Physical feasibility is required;
+connectivity is fixed after conservative generation, while operational attributes
+(±10%) and learned targets change. Bus counts stay within the configured ±25%
+limits. Learned teaching targets need not solve AC-OPF; physical solutions are
+exported separately.
+
+DD uses exact-gradient recomputation to reduce unroll memory, initializes its
+per-update rates from training-only calibration, then learns all of them. Ordinary
+student SGD uses a 0.1 safety factor on the calibrated rate, shared by synthetic
+and real controls. Calibration/validation/reporting seeds remain separate.
+Case500 DD lowers the physical-input Adam rate to 0.003; its Transformer additionally
+caps the **initial** inner rate at 1e-10 (lower bound 1e-14) after unstable larger-rate smoke trajectories.
+This ceiling does not freeze or cap subsequent learned rates. Ordinary-SGD
+comparison rates retain their common calibration protocol. This favors numerical
+stability; it does not establish good accuracy for this difficult DD condition.
+Resumption and artifact replay are checked for every condition. One synthesis
+seed limits conclusions about reproducibility across learned datasets.
+
+Outputs: `/lus/flare/projects/FRAME-IDP/siebenschuh/acopf_datasets/dataset_distillation/full256_20261013/full/`.
+`catalog.csv` identifies datasets, `best.pt` is validation-selected, `distilled.pt`
+or `condensed.pt` is final, and `latest.pt` resumes synthesis. `artifact.json` and
+`recipe.json` describe teaching targets and downstream training. Preparation pins
+the source snapshot, exact splits, reference IDs and checkpoint hashes. Resubmit
+the same root; completed, replay-verified conditions are skipped automatically.
+
+```bash
+python -m distillation.experiments.study prepare --config distillation/experiments/configs/full256.yaml --profile full
+python -m distillation.experiments.study submit --root /lus/flare/projects/FRAME-IDP/siebenschuh/acopf_datasets/dataset_distillation/full256_20261013/full --nodes 256 --no-copper
+```
+
+Preflight XPU job **8924392**: eight nodes, 29 conditions, including all eight
+architectures and 100-grid/100-update DD on case500. It passed 28 conditions;
+Transformer/case500 failed strict replay at its original starting rate. A targeted
+three-node retest (**8924415**) passed HEAT/HeteroGNN with smaller physical steps;
+Transformer still failed at 1e-6. The final training-only stability checks
+(**8924439**, [configuration](configs/full256_rate_smoke.yaml)) all passed at
+1e-10/1e-11/1e-12, including resume and strict replay. The full run takes the
+largest of these stable initial-rate ceilings. Results and failed attempts are
+preserved in `full256_20261013/validation/`; smoke success establishes operability,
+not data usefulness. `full256_20261013/resume_full.sh` resubmits unfinished work
+using the frozen source.
+
 ## Discovery pilot (2026-10-13)
 
 [Executable configuration](configs/discovery_pilot.yaml): **GIN, GAT, HEAT**,
@@ -79,10 +150,12 @@ pin the settings and inputs, `source/` freezes the runtime, and each run exports
 RAMBO source libraries are in `dataset_selection/RAMBO/discovery_20261013/pilot/`;
 the common catalog links them. The broader matrices below remain future plans.
 
-## Agreed full DD experiment (2026-10-13; planned)
+## Earlier full factorial DD proposal (2026-10-13)
 
-This records the agreed experiment matrix; the executable YAML still describes
-the earlier study. This full experiment has not been prepared or submitted.
+This records the earlier, broader factorial proposal. The submitted 256-node
+campaign above covers every model/case for fresh learned-target training and
+adaptation, with selected physical-label and fixed-initialization controls.
+The complete factorial below has not been submitted.
 
 Use all eight models (**GCN, GAT, GIN, Transformer, HGT, RGAT, HEAT, HeteroGNN**)
 and all five cases (**14, 30, 57, 118, 500**); exclude case2000. Use one synthesis

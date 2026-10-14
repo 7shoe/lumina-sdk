@@ -1,0 +1,176 @@
+# Case500 DD stability/replay: smaller physical steps; Transformer initial-rate cap.
+schema_version: 1
+campaign: full256_20261013
+paths:
+  output: /lus/flare/projects/FRAME-IDP/siebenschuh/acopf_datasets/dataset_distillation
+  models: /lus/flare/projects/FRAME-IDP/siebenschuh/acopf_models/synthetic
+  generated: /lus/flare/projects/FRAME-IDP/siebenschuh/acopf_datasets/dataset_selection/RAMBO
+  data: /lus/flare/projects/FRAME-IDP/siebenschuh/acopf_datasets/processed/T1
+  raw: /lus/flare/projects/FRAME-IDP/siebenschuh/acopf_datasets/raw/OPFData/dataset_release_1
+  references: /lus/flare/projects/FRAME-IDP/siebenschuh/acopf_datasets/dataset_distillation/full256_20261013/references
+  initializations: /lus/flare/projects/FRAME-IDP/siebenschuh/acopf_datasets/dataset_distillation/full256_20261013/initializations
+matrix:
+  cases:
+  - 500
+  protocols:
+  - conservative
+  target_modes:
+  - learned
+  initializations:
+  - random
+  seeds:
+  - 42
+shared:
+  synthetic_count: 100
+  batch_size: 10
+  strength: 0.1
+  split_seed: 42
+  model_precision: float64
+  real_batch: 64
+  training_seconds: 1800
+  max_updates: 1000
+  checkpoint_seconds: 120
+  eval_seconds: 450
+  reserve_seconds: 600
+  qualify: true
+model_defaults:
+  width: 128
+  layers: 3
+bus_limits:
+  14:
+  - 11
+  - 18
+  30:
+  - 23
+  - 38
+  57:
+  - 43
+  - 71
+  118:
+  - 89
+  - 148
+  500:
+  - 375
+  - 625
+initialization:
+  random:
+    mode: random
+    model_seed: 1000000
+  fixed:
+    mode: fixed
+    model_seed: 1000000
+  T1_case30:
+    mode: pretrained
+    checkpoint_pattern: /lus/flare/projects/FRAME-IDP/siebenschuh/acopf_models/T1/checkpoints/{model}/pglib_opf_case30_ieee/seed42/best.pt
+  T1_case14:
+    mode: pretrained
+    checkpoint_pattern: /lus/flare/projects/FRAME-IDP/siebenschuh/acopf_models/T1/checkpoints/{model}/pglib_opf_case14_ieee/seed42/best.pt
+  T1_case57:
+    mode: pretrained
+    checkpoint_pattern: /lus/flare/projects/FRAME-IDP/siebenschuh/acopf_models/T1/checkpoints/{model}/pglib_opf_case57_ieee/seed42/best.pt
+  T1_case118:
+    mode: pretrained
+    checkpoint_pattern: /lus/flare/projects/FRAME-IDP/siebenschuh/acopf_models/T1/checkpoints/{model}/pglib_opf_case118_ieee/seed42/best.pt
+methods:
+  DD:
+    models:
+    - HEAT
+    - HeteroGNN
+    settings:
+      passes: 10
+      inner_rate: 1.0e-06
+      outer_rate: 0.03
+      outer_target_rate: 0.003
+      topology_every: 0
+      common_evaluation: true
+      profile_real_batches:
+      - 64
+      checkpoint_inner: true
+      calibrate_inner_rate: true
+evaluation:
+  evaluation_epochs: 10
+  validation_samples: 256
+  final_samples: 1024
+  retention_samples: 256
+  eval_batch: 32
+  student_rates:
+  - 1.0e-08
+  - 1.0e-07
+  - 1.0e-06
+  - 1.0e-05
+  - 0.0001
+  - 0.001
+  calibration_samples: 128
+  calibration_panels: 2
+  trace_every: 10
+  trace_samples: 32
+  student_rate_factor: 0.1
+execution:
+  layout: combined
+  nodes: 256
+  ranks_per_node: 12
+  account: EpiCalib
+  queue: debug-scaling
+  walltime: 01:00:00
+  allocation_seconds: 3300
+  staging: true
+  copper: false
+  verify_run: true
+  activate: /home/siebenschuh/Projects/reasonABLE/env/Aurora/activate_reason_venv.sh
+profiles:
+  repair_smoke:
+    matrix:
+      cases:
+      - 500
+    shared:
+      synthetic_count: 100
+      batch_size: 10
+      min_topologies: 1
+      max_updates: 2
+      real_batch: 4
+      training_seconds: 600
+      reserve_seconds: 120
+    evaluation:
+      evaluation_epochs: 10
+      validation_samples: 16
+      final_samples: 32
+      retention_samples: 16
+      eval_batch: 16
+      calibration_samples: 32
+      calibration_panels: 1
+      student_rates:
+      - 1.0e-08
+      - 1.0e-06
+      - 0.0001
+      trace_samples: 8
+    methods:
+      DD:
+        settings:
+          passes: 10
+          profile_real_batches:
+          - 4
+          real_control_rates:
+          - 1.0e-08
+          - 1.0e-06
+          - 0.0001
+          outer_input_rate: 0.003
+          inner_rate_cap: null
+    execution:
+      nodes: 3
+    extra_conditions:
+    - methods:
+      - DD
+      cases:
+      - 500
+      protocols:
+      - conservative
+      target_modes:
+      - learned
+      initializations:
+      - random
+      seeds:
+      - 42
+      models:
+      - Transformer
+      settings:
+        inner_rate_cap: 1.0e-06

@@ -5,13 +5,13 @@
 #PBS -j oe
 #PBS -m n
 set -euo pipefail
+ulimit -c 0  # Failed ranks must not fill the run directory with core dumps.
 export STUDY_STARTED=$(date +%s)  # Include activation, imports and staging in the budget.
 source "${STUDY_ACTIVATE:?}"
 cd "${STUDY_SOURCE:?}"
 export OMP_NUM_THREADS=1 MKL_NUM_THREADS=1 OPENBLAS_NUM_THREADS=1 PYTHONUNBUFFERED=1 PYTHONDONTWRITEBYTECODE=1
 export ZE_FLAT_DEVICE_HIERARCHY=FLAT
 unset MPI4PY_RC_INITIALIZE RANK WORLD_SIZE LOCAL_RANK LOCAL_WORLD_SIZE MPI_LOCALRANKID SLURM_LOCALID PALS_LOCAL_RANKID STUDY_INPUT_MAP
-nodes=$(wc -l < "$PBS_NODEFILE")
 if [[ ${STUDY_COPPER:-0} == 1 ]]; then
     module load copper
     study_copper_mount="/tmp/${USER}/lumina-copper-${PBS_JOBID%%.*}"
@@ -26,6 +26,5 @@ if [[ ${STUDY_COPPER:-0} == 1 ]]; then
     export PYTHONPATH="${study_copper_mount}${VIRTUAL_ENV:?}/lib/python${study_python_version}/site-packages${PYTHONPATH:+:${PYTHONPATH}}"
 fi
 # Keep Copper service cores 48-51 free (also valid when Copper is disabled).
-mpiexec --pmi=pmix --envall -n "$((nodes * 12))" --ppn 12 --cpu-bind list:4:56:9:61:14:66:19:71:20:74:25:79 \
-    python -u -m distillation.synthetic.campaign --manifest "${STUDY_MANIFEST:?}" \
+python -u -m distillation.experiments.launch --manifest "${STUDY_MANIFEST:?}" \
     --allocation-seconds "${STUDY_BUDGET:?}"

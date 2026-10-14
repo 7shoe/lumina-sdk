@@ -52,15 +52,24 @@ def load(path=DEFAULT, profile='reference'):
     keys(value['matrix'], ['cases','protocols','target_modes','initializations','seeds'], 'matrix')
     keys(value['model_defaults'], ['width','layers'], 'model_defaults')
     keys(value['execution'], ['layout','nodes','ranks_per_node','account','queue','walltime',
-                              'allocation_seconds','activate','staging','copper','verify_run'], 'execution')
+                              'allocation_seconds','activate','staging','copper','verify_run',
+                              'max_retries','stall_seconds','minimum_attempt_seconds','launch_interval',
+                              'hmdc_microbatch'], 'execution')
     for name in ('staging', 'copper', 'verify_run'):
         if type(value['execution'].get(name, False)) is not bool: raise ValueError(f'execution.{name} must be boolean')
     if value['execution']['ranks_per_node'] != 12: raise ValueError('Use exactly 12 ranks per node')
     if value['execution']['layout'] not in ('combined','separate'): raise ValueError('Unknown execution layout')
+    for name, minimum in [('max_retries',0),('hmdc_microbatch',1)]:
+        item = value['execution'].get(name, 1)
+        if type(item) is not int or item < minimum: raise ValueError(f'Invalid execution.{name}')
+    for name in ('stall_seconds','minimum_attempt_seconds','launch_interval'):
+        item = value['execution'].get(name, 1.)
+        if type(item) not in (int,float) or not 0 <= item < float('inf'):
+            raise ValueError(f'Invalid execution.{name}')
     for method, settings in value['methods'].items():
         if method not in METHODS: raise ValueError(f'Unknown method: {method}; DC is named DCGM in manifests')
         keys(settings, ['models','domains','samplers','settings'] if method == 'RAMBO' else
-             ['pairs','settings'] if method == 'HMDC' else ['models','settings'], method)
+             ['pairs','settings','evaluators'] if method == 'HMDC' else ['models','settings'], method)
         if method == 'RAMBO':
             if not isinstance(settings.get('domains'), dict) or not settings['domains']:
                 raise ValueError('RAMBO needs named load domains')
@@ -128,7 +137,7 @@ def expand(spec, source_hashes=None):
     keys(spec['shared'], allowed, 'shared')
     keys(spec['evaluation'], allowed, 'evaluation')
     for group in groups:
-        keys(group, ['cases','protocols','target_modes','initializations','seeds','methods','models','pairs','domains','samplers'], 'condition matrix')
+        keys(group, ['cases','protocols','target_modes','initializations','seeds','methods','models','pairs','domains','samplers','settings'], 'condition matrix')
         dimensions = [group[k] for k in ('methods','cases','protocols','target_modes','initializations','seeds')]
         if any(not isinstance(v,list) or not v or len({str(x) for x in v}) != len(v) for v in dimensions):
             raise ValueError('Matrix dimensions must be nonempty unique lists')
@@ -154,10 +163,12 @@ def expand(spec, source_hashes=None):
                 members = list(choice) if method == 'HMDC' else [choice]
                 if not set(members) <= set(SUPPORTED_MODELS): raise ValueError('Unknown benchmark model')
                 cfg = FACTORIES[method](case, choice)
+                if method == 'HMDC' and entry.get('evaluators'):
+                    cfg['evaluation_models'] = entry['evaluators'].get('+'.join(members), members)
                 allowed = set(cfg) | {'generation_strength','generation_max_edits','min_topologies',
                     'training_model_seed','profile_real_batches','query_seed','query_selection_seed','real_training_seed','alignment_seed'}
                 for label, overrides in [('shared',spec['shared']),('evaluation',spec['evaluation']),
-                                         (method,entry.get('settings',{}))]:
+                                         (method,entry.get('settings',{})), ('condition settings', group.get('settings',{}))]:
                     keys(overrides, allowed, label)
                     cfg.update(overrides)
                 if cfg['synthetic_count'] % cfg['batch_size']: raise ValueError('synthetic_count must divide into complete batches')
@@ -276,10 +287,40 @@ def prepare(spec, path):
     return manifest
 
 
-def submit(root, *, methods=None, layout=None, nodes=None, copper=None):
+def refresh_runtime(root):
+    """Freeze an explicitly requested runtime revision without rewriting checkpoints.
+
+    Scientific configuration remains identical and is still checked by each
+    runner. Preserve both source snapshots and record every changed file.
+    """
+    root = Path(root).resolve()
+    original = json.loads((root/'manifest.json').read_text())['source_hashes']
+    hashes = source_files()
+    destination = root/'source_revisions'/digest(hashes)[:16]/'source'
+    for relative, expected in hashes.items():
+        target = destination/relative
+        target.parent.mkdir(parents=True, exist_ok=True)
+        if not target.exists(): shutil.copy2(ROOT/relative, target)
+        if file_hash(target) != expected: raise ValueError(f'Runtime snapshot changed: {relative}')
+    record = dict(source=str(destination), source_hashes=hashes,
+                  original_source_sha256=digest(original), runtime_source_sha256=digest(hashes),
+                  changed_files=[k for k in sorted(original.keys()|hashes.keys()) if original.get(k)!=hashes.get(k)],
+                  note='Runtime revision; original experiment configurations and checkpoints preserved.')
+    write_json(destination.parent/'source_hashes.json', hashes)
+    write_json(destination.parent/'revision.json', record)
+    write_json(root/'runtime.json', record)
+    return record
+
+
+def submit(root, *, methods=None, layout=None, nodes=None, copper=None, update_runtime=False):
     root = Path(root).resolve()
     manifest = json.loads((root/'manifest.json').read_text())
     execution = dict(manifest['specification']['execution'])
+    revision = (refresh_runtime(root) if update_runtime else
+                json.loads((root/'runtime.json').read_text()) if (root/'runtime.json').exists() else None)
+    source = Path(revision['source']) if revision else root/'source'
+    if revision:
+        manifest = manifest | {'source_hashes':revision['source_hashes'], 'runtime_revision':revision}
     if copper is not None:
         if type(copper) is not bool: raise ValueError('copper override must be boolean')
         execution['copper'] = copper
@@ -289,24 +330,38 @@ def submit(root, *, methods=None, layout=None, nodes=None, copper=None):
     for group in groups:
         selected = [r for r in manifest['experiments'] if r['method'] in group]
         if not selected: raise ValueError('Empty submission')
+        def finished(row):
+            folder = Path(row['output'])
+            artifact = folder/'artifact.json'
+            if not artifact.exists() or not json.loads(artifact.read_text()).get('complete'):
+                return False
+            if row.get('smoke') or row.get('verify_run'):
+                check = folder/'smoke.json'
+                return check.exists() and json.loads(check.read_text()).get('status') == 'PASS'
+            return True
+        selected = [row for row in selected if not finished(row)]
+        if not selected:
+            print(json.dumps(dict(methods=group, status='already_complete')), flush=True)
+            continue
         label = '+'.join(group)
         stamp = str(time.time_ns())
-        path = root/'manifests'/(f'{label}-{stamp}.json' if copper is not None else f'{label}.json')
+        path = root/'manifests'/f'{label}-{stamp}.json'
         write_json(path,manifest | {'experiments':selected,
             'specification':manifest['specification'] | {'execution':execution}})
         job_nodes = nodes or execution['nodes']
-        if type(job_nodes) is not int or not 1 <= job_nodes <= 64: raise ValueError('Use 1 to 64 nodes per job')
-        env = dict(STUDY_SOURCE=str(root/'source'),STUDY_MANIFEST=str(path),
+        if type(job_nodes) is not int or not 1 <= job_nodes <= 256: raise ValueError('Use 1 to 256 nodes per job')
+        job_nodes = min(job_nodes, len(selected))
+        env = dict(STUDY_SOURCE=str(source),STUDY_MANIFEST=str(path),
                    STUDY_ACTIVATE=execution['activate'],STUDY_BUDGET=str(execution['allocation_seconds']),
                    STUDY_COPPER=str(int(execution.get('copper', False))))
         if any(',' in v or '\n' in v for v in env.values()): raise ValueError('Invalid PBS environment value')
         log = root/'jobs'/f'{label}-{stamp}.log'; log.parent.mkdir(parents=True,exist_ok=True)
         command = ['qsub','-A',execution['account'],'-q',execution['queue'],'-l',f'select={job_nodes}',
             '-l',f"walltime={execution['walltime']}",'-o',str(log),'-v',','.join(f'{k}={v}' for k,v in env.items()),
-            str(root/'source/distillation/experiments/condensation.pbs')]
+            str(source/'distillation/experiments/condensation.pbs')]
         result = subprocess.run(command,check=True,text=True,capture_output=True)
         record = dict(job_id=result.stdout.strip(),methods=group,nodes=job_nodes,manifest=str(path),log=str(log),
-                      execution=execution,command=command)
+                      execution=execution,command=command,runtime_revision=revision)
         write_json(root/'jobs'/f'{stamp}.json',record)
         print(json.dumps(record),flush=True)
 
@@ -320,6 +375,8 @@ def main():
     parser.add_argument('--methods',nargs='+',choices=METHODS)
     parser.add_argument('--layout',choices=['combined','separate'])
     parser.add_argument('--nodes',type=int,help='Nodes PER job; separate submits one job per method')
+    parser.add_argument('--refresh-runtime',action='store_true',
+                        help='Freeze current runtime as an explicit, recorded revision for existing checkpoints')
     parser.add_argument('--copper',action=argparse.BooleanOptionalAction,default=None,
                         help='Override optional package caching for this submission; preserve frozen experiment identities')
     args=parser.parse_args()
@@ -331,7 +388,8 @@ def main():
             paths=[r['output'] for r in result['experiments']]),indent=2))
     else:
         if args.root is None: parser.error('--root is required')
-        if args.action=='submit': submit(args.root,methods=args.methods,layout=args.layout,nodes=args.nodes,copper=args.copper)
+        if args.action=='submit': submit(args.root,methods=args.methods,layout=args.layout,nodes=args.nodes,
+                                        copper=args.copper,update_runtime=args.refresh_runtime)
         else:
             from distillation.synthetic.artifacts import catalog
             catalog(json.loads((args.root/'manifest.json').read_text()))

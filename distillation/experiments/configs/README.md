@@ -1,5 +1,10 @@
 # DD / DCGM / HMDC / RAMBO configuration
 
+The eight-model campaign is [full256.yaml](full256.yaml), profile `full`: 256
+DD/DCGM/HMDC conditions across cases14/30/57/118/500. The `xpu_smoke` profile
+checks all architectures, adaptation, resumption/replay and case500 DD memory.
+See the [exact matrix](../README.md#full-eight-model-campaign-2026-10-13).
+
 The small discovery study is [discovery_pilot.yaml](discovery_pilot.yaml), profile
 `pilot`: GIN/GAT/HEAT, cases30/57, 30 condensation runs plus four RAMBO/uniform
 libraries reused by 18 student evaluations. It requests 32 nodes for one hour,
@@ -81,9 +86,33 @@ node; existing shared initialization and generation checkpoints remain on Lustre
 Canonical paths, sample IDs, splits and experiment identities do not change.
 `execution.copper: true` uses Aurora's Copper module for custom Python packages;
 the system framework installation stays in place. Both switches can be disabled.
-The launcher supports 1–64 nodes, counts startup against `allocation_seconds`, and
+The launcher supports 1–256 nodes, counts startup against `allocation_seconds`, and
 records per-node copy sizes, timings and dataset-cache hits in `jobs/startup_*.json`.
 All outputs stay on Lustre; `/tmp` is only a disposable input cache.
+
+Each condition runs in its own **one-node, 12-rank MPI launch**. The supervisor
+records attempts under `jobs/launch_<PBS_JOBID>/`, retries failures once, and
+quarantines a node after a 20-minute lack of progress. Healthy siblings continue.
+Use `execution.max_retries`, `stall_seconds`, and `launch_interval` to adjust this.
+Resubmitting the same study skips complete, replay-verified datasets and restores
+each unfinished condition's `latest.pt`, regardless of its new node assignment.
+`launch_status.json` and the allocation's `summary.json` record interruptions;
+an old `status.json: TRAINING` does not mean its process is still alive.
+
+For an existing study that needs the updated launcher, explicitly use
+`study submit --root PATH --refresh-runtime`. This preserves the original source
+and all experiment configurations, freezes a revision under `source_revisions/`,
+and records it in `runtime.json` and per-attempt provenance. Subsequent submissions
+reuse that revision. HMDC case500 uses `execution.hmdc_microbatch: 8` by default:
+the full gradient-matching objective is accumulated in chunks, retaining all
+synthetic grids and the original real-example batch size.
+
+Replay first uses the strict elementwise weight comparison. Nondeterministic
+accelerator reductions can accumulate during attention-model training; a fallback
+requires weight error below `1e-4` absolute and `1e-5` relative L2, then checks all
+exported grids: at most 0.5% prediction L2 drift per target type and 0.1% teaching
+loss drift. `smoke.json/replay_checks` records strict versus numerical matches and
+the measured errors. These checks certify replay fidelity, not dataset usefulness.
 
 Staging validated on 2026-10-13: PBS `8923910`, two nodes / 24 XPUs, 15m49s;
 all nine integration conditions passed, including resume and exported-data replay.

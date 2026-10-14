@@ -1,0 +1,816 @@
+# 256 conditions: 210 main + 4 fixed + 24 solver + 18 schedule/size comparisons.
+# Case500 DD uses smaller physical steps; Transformer starts at <=1e-10 but still learns every rate.
+schema_version: 1
+campaign: full256_20261013
+paths:
+  output: /lus/flare/projects/FRAME-IDP/siebenschuh/acopf_datasets/dataset_distillation
+  models: /lus/flare/projects/FRAME-IDP/siebenschuh/acopf_models/synthetic
+  generated: /lus/flare/projects/FRAME-IDP/siebenschuh/acopf_datasets/dataset_selection/RAMBO
+  data: /lus/flare/projects/FRAME-IDP/siebenschuh/acopf_datasets/processed/T1
+  raw: /lus/flare/projects/FRAME-IDP/siebenschuh/acopf_datasets/raw/OPFData/dataset_release_1
+  references: /lus/flare/projects/FRAME-IDP/siebenschuh/acopf_datasets/dataset_distillation/full256_20261013/references
+  initializations: /lus/flare/projects/FRAME-IDP/siebenschuh/acopf_datasets/dataset_distillation/full256_20261013/initializations
+matrix:
+  cases:
+  - 14
+  - 30
+  - 57
+  - 118
+  - 500
+  protocols:
+  - conservative
+  target_modes:
+  - learned
+  initializations:
+  - random
+  seeds:
+  - 42
+shared:
+  synthetic_count: 100
+  batch_size: 10
+  strength: 0.1
+  split_seed: 42
+  model_precision: float64
+  real_batch: 64
+  training_seconds: 1800
+  max_updates: 1000
+  checkpoint_seconds: 120
+  eval_seconds: 450
+  reserve_seconds: 600
+  qualify: true
+model_defaults:
+  width: 128
+  layers: 3
+bus_limits:
+  14:
+  - 11
+  - 18
+  30:
+  - 23
+  - 38
+  57:
+  - 43
+  - 71
+  118:
+  - 89
+  - 148
+  500:
+  - 375
+  - 625
+initialization:
+  random:
+    mode: random
+    model_seed: 1000000
+  fixed:
+    mode: fixed
+    model_seed: 1000000
+  T1_case30:
+    mode: pretrained
+    checkpoint_pattern: /lus/flare/projects/FRAME-IDP/siebenschuh/acopf_models/T1/checkpoints/{model}/pglib_opf_case30_ieee/seed42/best.pt
+  T1_case14:
+    mode: pretrained
+    checkpoint_pattern: /lus/flare/projects/FRAME-IDP/siebenschuh/acopf_models/T1/checkpoints/{model}/pglib_opf_case14_ieee/seed42/best.pt
+  T1_case57:
+    mode: pretrained
+    checkpoint_pattern: /lus/flare/projects/FRAME-IDP/siebenschuh/acopf_models/T1/checkpoints/{model}/pglib_opf_case57_ieee/seed42/best.pt
+  T1_case118:
+    mode: pretrained
+    checkpoint_pattern: /lus/flare/projects/FRAME-IDP/siebenschuh/acopf_models/T1/checkpoints/{model}/pglib_opf_case118_ieee/seed42/best.pt
+methods:
+  DD:
+    models: &id001
+    - GCN
+    - GAT
+    - GIN
+    - Transformer
+    - HGT
+    - RGAT
+    - HEAT
+    - HeteroGNN
+    settings:
+      passes: 10
+      inner_rate: 1.0e-06
+      outer_rate: 0.03
+      outer_target_rate: 0.003
+      topology_every: 0
+      common_evaluation: true
+      profile_real_batches:
+      - 64
+      checkpoint_inner: true
+      calibrate_inner_rate: true
+  DCGM:
+    models: *id001
+    settings:
+      data_rate: 0.1
+      target_rate: 0.003
+      restart_rounds: 11
+      student_epochs: 1
+  HMDC:
+    pairs:
+    - - GAT
+      - RGAT
+    - - Transformer
+      - HGT
+    - - GCN
+      - GIN
+    - - HeteroGNN
+      - HGT
+    - - GIN
+      - HEAT
+    settings:
+      data_rate: 0.005
+      target_rate: 0.003
+      restart_rounds: 100
+      real_steps: 2
+      query_interval: 10
+      candidate_pool: 256
+    evaluators:
+      GAT+RGAT:
+      - GAT
+      - RGAT
+      - GIN
+      - HEAT
+      Transformer+HGT:
+      - Transformer
+      - HGT
+      - GCN
+      - HeteroGNN
+      GCN+GIN:
+      - GCN
+      - GIN
+      - GAT
+      - RGAT
+      HeteroGNN+HGT:
+      - HeteroGNN
+      - HGT
+      - Transformer
+      - HEAT
+      GIN+HEAT:
+      - GIN
+      - HEAT
+      - HGT
+      - GCN
+evaluation:
+  evaluation_epochs: 10
+  validation_samples: 256
+  final_samples: 1024
+  retention_samples: 256
+  eval_batch: 32
+  student_rates:
+  - 1.0e-08
+  - 1.0e-07
+  - 1.0e-06
+  - 1.0e-05
+  - 0.0001
+  - 0.001
+  calibration_samples: 128
+  calibration_panels: 2
+  trace_every: 10
+  trace_samples: 32
+  student_rate_factor: 0.1
+execution:
+  layout: combined
+  nodes: 256
+  ranks_per_node: 12
+  account: EpiCalib
+  queue: debug-scaling
+  walltime: 01:00:00
+  allocation_seconds: 3300
+  staging: true
+  copper: false
+  verify_run: true
+  max_retries: 1
+  stall_seconds: 1200
+  hmdc_microbatch: 8
+  activate: /home/siebenschuh/Projects/reasonABLE/env/Aurora/activate_reason_venv.sh
+profiles:
+  full:
+    extra_conditions:
+    - methods:
+      - DD
+      - DCGM
+      - HMDC
+      cases:
+      - 14
+      protocols:
+      - conservative
+      target_modes:
+      - learned
+      initializations:
+      - T1_case30
+      seeds:
+      - 42
+    - methods:
+      - DD
+      - DCGM
+      - HMDC
+      cases:
+      - 30
+      protocols:
+      - conservative
+      target_modes:
+      - learned
+      initializations:
+      - T1_case14
+      seeds:
+      - 42
+    - methods:
+      - DD
+      - DCGM
+      - HMDC
+      cases:
+      - 57
+      protocols:
+      - conservative
+      target_modes:
+      - learned
+      initializations:
+      - T1_case30
+      seeds:
+      - 42
+    - methods:
+      - DD
+      - DCGM
+      - HMDC
+      cases:
+      - 118
+      protocols:
+      - conservative
+      target_modes:
+      - learned
+      initializations:
+      - T1_case57
+      seeds:
+      - 42
+    - methods:
+      - DD
+      - DCGM
+      cases:
+      - 30
+      - 57
+      protocols:
+      - conservative
+      target_modes:
+      - learned
+      initializations:
+      - fixed
+      seeds:
+      - 42
+      models:
+      - GAT
+    - methods:
+      - DD
+      - DCGM
+      - HMDC
+      cases:
+      - 57
+      protocols:
+      - conservative
+      target_modes:
+      - solver
+      initializations:
+      - T1_case30
+      seeds:
+      - 42
+    - methods:
+      - DD
+      - DCGM
+      cases:
+      - 30
+      protocols:
+      - conservative
+      target_modes:
+      - solver
+      initializations:
+      - random
+      seeds:
+      - 42
+      models:
+      - GAT
+    - methods:
+      - HMDC
+      cases:
+      - 30
+      protocols:
+      - conservative
+      target_modes:
+      - solver
+      initializations:
+      - random
+      seeds:
+      - 42
+      pairs:
+      - - GIN
+        - HEAT
+    - methods:
+      - DD
+      cases:
+      - 30
+      protocols:
+      - conservative
+      target_modes:
+      - learned
+      initializations:
+      - random
+      seeds:
+      - 42
+      models:
+      - HEAT
+      settings:
+        evaluation_epochs: 30
+        passes: 30
+    - methods:
+      - DD
+      cases:
+      - 30
+      protocols:
+      - conservative
+      target_modes:
+      - learned
+      initializations:
+      - random
+      seeds:
+      - 42
+      models:
+      - HEAT
+      settings:
+        evaluation_epochs: 5
+        synthetic_count: 200
+        passes: 5
+    - methods:
+      - DD
+      cases:
+      - 30
+      protocols:
+      - conservative
+      target_modes:
+      - learned
+      initializations:
+      - random
+      seeds:
+      - 42
+      models:
+      - HEAT
+      settings:
+        evaluation_epochs: 25
+        batch_size: 25
+        passes: 25
+    - methods:
+      - DD
+      cases:
+      - 57
+      protocols:
+      - conservative
+      target_modes:
+      - learned
+      initializations:
+      - T1_case30
+      seeds:
+      - 42
+      models:
+      - GIN
+      settings:
+        evaluation_epochs: 30
+        passes: 30
+    - methods:
+      - DD
+      cases:
+      - 57
+      protocols:
+      - conservative
+      target_modes:
+      - learned
+      initializations:
+      - T1_case30
+      seeds:
+      - 42
+      models:
+      - GIN
+      settings:
+        evaluation_epochs: 5
+        synthetic_count: 200
+        passes: 5
+    - methods:
+      - DD
+      cases:
+      - 57
+      protocols:
+      - conservative
+      target_modes:
+      - learned
+      initializations:
+      - T1_case30
+      seeds:
+      - 42
+      models:
+      - GIN
+      settings:
+        evaluation_epochs: 25
+        batch_size: 25
+        passes: 25
+    - methods:
+      - DCGM
+      cases:
+      - 30
+      protocols:
+      - conservative
+      target_modes:
+      - learned
+      initializations:
+      - random
+      seeds:
+      - 42
+      models:
+      - HEAT
+      settings:
+        evaluation_epochs: 30
+        restart_rounds: 31
+    - methods:
+      - DCGM
+      cases:
+      - 30
+      protocols:
+      - conservative
+      target_modes:
+      - learned
+      initializations:
+      - random
+      seeds:
+      - 42
+      models:
+      - HEAT
+      settings:
+        evaluation_epochs: 5
+        synthetic_count: 200
+        restart_rounds: 6
+    - methods:
+      - DCGM
+      cases:
+      - 30
+      protocols:
+      - conservative
+      target_modes:
+      - learned
+      initializations:
+      - random
+      seeds:
+      - 42
+      models:
+      - HEAT
+      settings:
+        evaluation_epochs: 25
+        batch_size: 25
+        restart_rounds: 26
+    - methods:
+      - DCGM
+      cases:
+      - 57
+      protocols:
+      - conservative
+      target_modes:
+      - learned
+      initializations:
+      - T1_case30
+      seeds:
+      - 42
+      models:
+      - GIN
+      settings:
+        evaluation_epochs: 30
+        restart_rounds: 31
+    - methods:
+      - DCGM
+      cases:
+      - 57
+      protocols:
+      - conservative
+      target_modes:
+      - learned
+      initializations:
+      - T1_case30
+      seeds:
+      - 42
+      models:
+      - GIN
+      settings:
+        evaluation_epochs: 5
+        synthetic_count: 200
+        restart_rounds: 6
+    - methods:
+      - DCGM
+      cases:
+      - 57
+      protocols:
+      - conservative
+      target_modes:
+      - learned
+      initializations:
+      - T1_case30
+      seeds:
+      - 42
+      models:
+      - GIN
+      settings:
+        evaluation_epochs: 25
+        batch_size: 25
+        restart_rounds: 26
+    - methods:
+      - HMDC
+      cases:
+      - 30
+      protocols:
+      - conservative
+      target_modes:
+      - learned
+      initializations:
+      - random
+      seeds:
+      - 42
+      pairs:
+      - - GIN
+        - HEAT
+      settings:
+        evaluation_epochs: 30
+    - methods:
+      - HMDC
+      cases:
+      - 30
+      protocols:
+      - conservative
+      target_modes:
+      - learned
+      initializations:
+      - random
+      seeds:
+      - 42
+      pairs:
+      - - GIN
+        - HEAT
+      settings:
+        evaluation_epochs: 5
+        synthetic_count: 200
+    - methods:
+      - HMDC
+      cases:
+      - 30
+      protocols:
+      - conservative
+      target_modes:
+      - learned
+      initializations:
+      - random
+      seeds:
+      - 42
+      pairs:
+      - - GIN
+        - HEAT
+      settings:
+        evaluation_epochs: 25
+        batch_size: 25
+    - methods:
+      - HMDC
+      cases:
+      - 57
+      protocols:
+      - conservative
+      target_modes:
+      - learned
+      initializations:
+      - T1_case30
+      seeds:
+      - 42
+      pairs:
+      - - GIN
+        - HEAT
+      settings:
+        evaluation_epochs: 30
+    - methods:
+      - HMDC
+      cases:
+      - 57
+      protocols:
+      - conservative
+      target_modes:
+      - learned
+      initializations:
+      - T1_case30
+      seeds:
+      - 42
+      pairs:
+      - - GIN
+        - HEAT
+      settings:
+        evaluation_epochs: 5
+        synthetic_count: 200
+    - methods:
+      - HMDC
+      cases:
+      - 57
+      protocols:
+      - conservative
+      target_modes:
+      - learned
+      initializations:
+      - T1_case30
+      seeds:
+      - 42
+      pairs:
+      - - GIN
+        - HEAT
+      settings:
+        evaluation_epochs: 25
+        batch_size: 25
+    - methods:
+      - DCGM
+      - HMDC
+      cases: &id002
+      - 500
+      protocols: &id003
+      - conservative
+      target_modes: &id004
+      - learned
+      initializations: &id005
+      - random
+      seeds: &id006
+      - 42
+    - methods:
+      - DD
+      cases: *id002
+      protocols: *id003
+      target_modes: *id004
+      initializations: *id005
+      seeds: *id006
+      models: &id012
+      - GCN
+      - GAT
+      - GIN
+      - HGT
+      - RGAT
+      - HEAT
+      - HeteroGNN
+      settings:
+        outer_input_rate: 0.003
+    - methods:
+      - DD
+      cases: *id002
+      protocols: *id003
+      target_modes: *id004
+      initializations: *id005
+      seeds: *id006
+      models:
+      - Transformer
+      settings:
+        outer_input_rate: 0.003
+        inner_rate_cap: 1.0e-10
+        rate_min: 1.0e-14
+    - methods:
+      - DCGM
+      - HMDC
+      cases: &id007
+      - 500
+      protocols: &id008
+      - conservative
+      target_modes: &id009
+      - learned
+      initializations: &id010
+      - T1_case118
+      seeds: &id011
+      - 42
+    - methods:
+      - DD
+      cases: *id007
+      protocols: *id008
+      target_modes: *id009
+      initializations: *id010
+      seeds: *id011
+      models: *id012
+      settings:
+        outer_input_rate: 0.003
+    - methods:
+      - DD
+      cases: *id007
+      protocols: *id008
+      target_modes: *id009
+      initializations: *id010
+      seeds: *id011
+      models:
+      - Transformer
+      settings:
+        outer_input_rate: 0.003
+        inner_rate_cap: 1.0e-10
+        rate_min: 1.0e-14
+    matrix:
+      cases:
+      - 14
+      - 30
+      - 57
+      - 118
+  xpu_smoke:
+    matrix:
+      cases:
+      - 30
+    shared:
+      synthetic_count: 4
+      batch_size: 2
+      min_topologies: 1
+      max_updates: 2
+      real_batch: 4
+      training_seconds: 600
+      reserve_seconds: 120
+    evaluation:
+      evaluation_epochs: 2
+      validation_samples: 16
+      final_samples: 32
+      retention_samples: 16
+      eval_batch: 16
+      calibration_samples: 32
+      calibration_panels: 1
+      student_rates:
+      - 1.0e-08
+      - 1.0e-06
+      - 0.0001
+      trace_samples: 8
+    methods:
+      DD:
+        settings:
+          passes: 2
+          profile_real_batches:
+          - 4
+          real_control_rates:
+          - 1.0e-08
+          - 1.0e-06
+          - 0.0001
+      HMDC:
+        settings:
+          candidate_pool: 16
+    execution:
+      nodes: 8
+    extra_conditions:
+    - methods:
+      - DD
+      cases:
+      - 500
+      protocols:
+      - conservative
+      target_modes:
+      - learned
+      initializations:
+      - random
+      seeds:
+      - 42
+      models:
+      - HEAT
+      - Transformer
+      - HeteroGNN
+      settings:
+        synthetic_count: 100
+        batch_size: 10
+        passes: 10
+        evaluation_epochs: 10
+    - methods:
+      - DCGM
+      cases:
+      - 57
+      protocols:
+      - conservative
+      target_modes:
+      - learned
+      initializations:
+      - random
+      seeds:
+      - 42
+      models:
+      - GAT
+    - methods:
+      - DCGM
+      cases:
+      - 30
+      protocols:
+      - conservative
+      target_modes:
+      - learned
+      initializations:
+      - fixed
+      seeds:
+      - 42
+      models:
+      - HEAT
+    - methods:
+      - DD
+      - DCGM
+      - HMDC
+      cases:
+      - 57
+      protocols:
+      - conservative
+      target_modes:
+      - learned
+      initializations:
+      - T1_case30
+      seeds:
+      - 42
+      models:
+      - GIN
+      pairs:
+      - - GIN
+        - HEAT
