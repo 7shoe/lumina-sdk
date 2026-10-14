@@ -223,7 +223,11 @@ def compare_export(folder, artifact, original, config, dataset, split, comm, dev
             return None
         excluded = artifact['training_state']['seed_ids']
         population = split['train'][~np.isin(split['train'], excluded)]
-        _, report['calibration'] = calibrate(original, config, dataset, population, comm, device)
+        calibrated = folder/'inner_calibration.json'
+        if config.get('calibrate_inner_rate') and config['passes'] == config['evaluation_epochs'] and calibrated.exists():
+            report['calibration'] = json.loads(calibrated.read_text())
+        else:
+            _, report['calibration'] = calibrate(original, config, dataset, population, comm, device)
         persist()
     ids = split['val'][config['validation_samples']:config['validation_samples']+config['final_samples']]
     initial = torch.load(folder/'initial.pt', weights_only=False, map_location='cpu')['graphs']

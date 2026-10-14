@@ -252,6 +252,8 @@ def train_student(model, optimizer, synthetic, *, epochs=1, batch_size=16, seed=
                                                for p in model.parameters()):
                 raise FloatingPointError('Nonfinite ordinary student SGD')
             optimizer.step()
+            if any(not torch.isfinite(p).all() for p in model.parameters()):
+                raise FloatingPointError('Nonfinite ordinary student SGD parameters after update')
             value = float(loss.detach())
             updates += 1
             presentations += batch.num_graphs

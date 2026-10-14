@@ -40,7 +40,8 @@ def publish(experiment, *, failure=None):
         failure=failure, feature_encoding='synthetic.learning.benchmark_graph; SDK OPF feature ordering',
         targets={'bus':['va (radians)','vm (per unit)'], 'generator':['pg (per unit)','qg (per unit)']},
         physical_labels='physical_solved_graphs: separate AC-OPF solutions; never replace teaching targets',
-        split=read(folder/'split.json',{}))
+        split=read(folder/'split.json',{}),
+        execution_provenance=[p.name for p in sorted(folder.glob('provenance_*.json'))])
     if generated:
         record.update(generation_id=cfg['generation_id'], generation_domain=cfg['generation_domain'],
             generation_manifest=str(Path(cfg['generation_output'])/'dataset.json'),
@@ -104,6 +105,9 @@ def catalog(manifest):
                 generation=cfg['generation_protocol'],target_mode=cfg['target_mode'],
                 initialization=cfg['initialization'],initialization_name=cfg['artifact_identity']['initialization_name'],
                 synthesis_seed=cfg['data_seed'],synthetic_count=cfg['synthetic_count'],
+                batch_size=cfg['batch_size'],synthetic_batches=cfg['batches'],
+                ordinary_epochs=cfg['evaluation_epochs'],ordinary_updates=cfg['batches']*cfg['evaluation_epochs'],
+                native_updates=cfg['batches']*(cfg['passes'] if experiment['method']=='DD' else cfg['evaluation_epochs']),
                 purpose='smoke' if experiment.get('smoke') else 'experiment',status=status,
                 ready=bool(status=='COMPLETE' and artifact.get('complete') and artifact.get('sha256')),
                 dataset=str(folder/artifact['dataset']) if artifact.get('dataset') else None,

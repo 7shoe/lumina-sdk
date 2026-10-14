@@ -10,6 +10,7 @@ import shutil
 import time
 import traceback
 import tempfile
+import sys
 
 STARTED = float(os.environ.get('STUDY_STARTED', time.time()))
 
@@ -21,6 +22,7 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('--manifest', type=Path, required=True)
     parser.add_argument('--allocation-seconds', type=float, default=3300)
+    parser.add_argument('--result', type=Path, help='Per-attempt result for the independent launcher')
     args = parser.parse_args()
     
     # MPI import
@@ -34,17 +36,21 @@ def main():
     comm = world.Split(node, world.rank)
     if comm.size != 12:
         raise ValueError('Use exactly 12 ranks per node')
+    if args.result and (world.size != 12 or len(unique) != 1):
+        raise ValueError('Isolated attempts must use exactly one node and 12 ranks')
     
     # set torch
     torch.set_num_threads(1)
     threadpool_limits(limits=1)
     torch.xpu.set_device(comm.rank)
     device = torch.device(f'xpu:{comm.rank}')
+    torch.xpu.reset_peak_memory_stats(device)
     assignments = comm.allgather(dict(rank=comm.rank, host=socket.gethostname(), device=str(device),
         uuid=str(torch.xpu.get_device_properties(device).uuid)))
     if len({r['uuid'] for r in assignments}) != 12:
         raise RuntimeError('Expected 12 distinct XPUs')
     manifest = json.loads(args.manifest.read_text())
+    results = []
     deadline = STARTED + args.allocation_seconds
     
     from distillation.training.T1_single_topo.common import claim, write_json
@@ -110,12 +116,14 @@ def main():
                 from importlib.metadata import version
                 source = Path.cwd()
                 hashes = source.parent / f'{source.name}_hashes.json'
-                write_json(folder / f"provenance_{os.environ.get('PBS_JOBID', 'local')}.json", dict(
+                write_json(folder / f"provenance_{os.environ.get('PBS_JOBID', 'local')}_attempt{os.environ.get('STUDY_ATTEMPT', '1')}.json", dict(
                     job=os.environ.get('PBS_JOBID'), method=method, source=str(source),
                     source_hashes=str(hashes) if hashes.exists() else None,
                     python=platform.python_version(), torch=str(torch.__version__),
                     packages={name: version(name) for name in ('numpy', 'scipy', 'torch-geometric', 'pypower', 'mpi4py')},
-                    mpi=MPI.Get_library_version(), workers=comm.size))
+                    mpi=MPI.Get_library_version(), workers=comm.size,
+                    runtime_revision=manifest.get('runtime_revision'),
+                    hmdc_microbatch=int(os.environ.get('STUDY_HMDC_MICROBATCH','0'))))
             if experiment.get('smoke') or experiment.get('verify_run'):
                 from distillation.experiments.smoke import run, run_rambo
                 if method == 'RAMBO': run = run_rambo
@@ -127,10 +135,17 @@ def main():
             if manifest.get('schema_version') == 1:
                 from distillation.synthetic.artifacts import publish, catalog
                 collectively(comm,lambda: publish(experiment) if comm.rank==0 else None)
-                if comm.rank==0: catalog(manifest)
+                if comm.rank==0:
+                    catalog(json.loads(Path(manifest['catalog_manifest']).read_text())
+                            if manifest.get('catalog_manifest') else manifest)
+            results.append(dict(dataset_id=experiment['dataset_id'], status=state['status'],
+                iteration=state.get('iteration'), resume_count=state.get('resume_count'),
+                accepted_updates=state.get('accepted_updates'),
+                peak_xpu_bytes=comm.allgather(torch.xpu.max_memory_allocated(device))))
             if comm.rank == 0:
                 print(json.dumps(dict(output=str(folder), status=state['status'])), flush=True)
         except Exception:
+            results.append(dict(dataset_id=experiment['dataset_id'], status='FAILED'))
             (folder / f'failure_rank{comm.rank:02d}.txt').write_text(traceback.format_exc())
             if comm.rank == 0:
                 (folder / 'failure.txt').write_text(traceback.format_exc())
@@ -139,7 +154,8 @@ def main():
                     from distillation.synthetic.artifacts import publish, catalog
                     try:
                         publish(experiment,failure=(folder/'failure.txt').read_text())
-                        catalog(manifest)
+                        catalog(json.loads(Path(manifest['catalog_manifest']).read_text())
+                                if manifest.get('catalog_manifest') else manifest)
                     except Exception:
                         (folder/'artifact_failure.txt').write_text(traceback.format_exc())
             # Collective failures (including initialization) leave other nodes running.
@@ -152,7 +168,11 @@ def main():
         write_json(startup_path, startup)
         if 'staging' in startup:
             shutil.rmtree(Path(mapping).parent)
+        if args.result:
+            write_json(args.result, dict(status=results[0]['status'] if len(results)==1 else 'INCOMPLETE',
+                                         experiments=results))
+    return int(any(row['status']=='FAILED' for row in results))
 
 
 if __name__ == '__main__':
-    main()
+    sys.exit(main())
