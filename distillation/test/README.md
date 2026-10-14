@@ -21,4 +21,24 @@ OMP_NUM_THREADS=1 MKL_NUM_THREADS=1 OPENBLAS_NUM_THREADS=1 \
 python -m pytest distillation/test/test_hmdc.py distillation/test/test_dcgm.py -q
 ```
 
-The twelve-XPU continuation check is documented in [HMDC](../HMDC/README.md).
+The twelve-XPU continuation check is documented in [HMDC](../HMDC/aux/README.md).
+
+Independent-launch failure/retry tests and exact HMDC microbatch derivatives:
+
+```bash
+python -m pytest distillation/test/test_isolated_launch.py distillation/test/test_hmdc.py -q
+```
+
+Inside a two-node PBS allocation, from the frozen runtime directory, run
+`python /path/to/isolated_xpu.py --root /lustre/validation/faults`.
+It intentionally kills one rank and stalls another, verifies that their sibling
+continues on its own 12 XPUs, and checks that retries restore saved state.
+
+RAMBO generation, shared study configuration, resume and portable artifact replay:
+
+```bash
+python -m pytest distillation/test/test_rambo.py distillation/test/test_rambo_study.py distillation/test/test_experiment_study.py -q
+```
+
+The shared [integration smoke profile](../experiments/configs/README.md) runs real
+Julia generation and XPU student evaluation alongside DD/DCGM/HMDC.

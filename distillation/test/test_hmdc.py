@@ -154,6 +154,36 @@ def test_real_model_training_and_affine_training_update_separate_parameters(grap
     assert any(not torch.equal(v,pair.alignment.state_dict()[k]) for k,v in alignment.items())
 
 
+@pytest.mark.parametrize('names', [('Transformer','HGT'),('GAT','RGAT'),('GCN','GIN'),('HeteroGNN','HGT'),('GIN','HEAT')])
+@pytest.mark.parametrize('balanced', [False,True])
+def test_microbatches_preserve_full_objective_data_gradients_and_balance(graph,names,balanced):
+    cfg=config(names);pair=build_pair(graph,cfg,{k:1e-8 for k in names},86,'cpu')
+    synthetic=SyntheticInputs([graph]*3,target_mode='learned')
+    with torch.no_grad():
+        for i,p in enumerate(synthetic.parameters()):p.fill_(.01*(i%5))
+    other=deepcopy(synthetic);balance=deepcopy(pair.balance)
+    real=Batch.from_data_list([benchmark_graph(graph,labels=True)]*3)
+    full=data_gradients(pair.models,pair.alignment,pair.balance,synthetic,real,balanced=balanced,microbatch=0)
+    chunked=data_gradients(pair.models,pair.alignment,balance,other,real,balanced=balanced,microbatch=2)
+    assert chunked['terms']==pytest.approx(full['terms'],rel=1e-8,abs=1e-10)
+    assert chunked['loss']==pytest.approx(full['loss'],rel=1e-8,abs=1e-10)
+    torch.testing.assert_close(pair.balance.accumulator,balance.accumulator,rtol=1e-8,atol=1e-10)
+    for a,b in zip(synthetic.parameters(),other.parameters()):
+        torch.testing.assert_close(a.grad,b.grad,rtol=1e-7,atol=1e-9)
+    assert all(p.grad is None for m in pair.models for p in m.parameters())
+    copied=build_pair(graph,cfg,{k:1e-8 for k in names},86,'cpu')
+    copied.load_state_dict(pair.state_dict())
+    model_step(pair.models,pair.alignment,pair.optimizers,real,microbatch=0)
+    model_step(copied.models,copied.alignment,copied.optimizers,real,microbatch=2)
+    for left,right in zip(pair.models,copied.models):
+        for key,value in left.state_dict().items():
+            torch.testing.assert_close(value,right.state_dict()[key],rtol=1e-9,atol=1e-11)
+    alignment_step(pair.models,pair.alignment,pair.alignment_optimizer,real,microbatch=0)
+    alignment_step(copied.models,copied.alignment,copied.alignment_optimizer,real,microbatch=2)
+    for key,value in pair.alignment.state_dict().items():
+        torch.testing.assert_close(value,copied.alignment.state_dict()[key],rtol=1e-9,atol=1e-11)
+
+
 def test_resume_reproduces_next_data_model_alignment_and_balance_updates(graph):
     cfg=config();rates={'GAT':1e-9,'GIN':1e-9}
     pair=build_pair(graph,cfg,rates,89,'cpu');synthetic=SyntheticInputs([graph])
@@ -187,7 +217,7 @@ def test_representative_selection_is_seeded_unique_and_handles_duplicate_feature
 
 
 def test_exploration_pairs_protocols_and_bus_budgets(tmp_path):
-    from distillation.HMDC.launch import CROSS_PAIRS, exploration
+    from distillation.HMDC.aux.launch import CROSS_PAIRS, exploration
     from distillation.HMDC.campaign import validate_config
     from distillation.synthetic.experiments import balanced_sizes
     experiments=exploration(tmp_path)
@@ -221,6 +251,6 @@ def test_larger_synthetic_budget_cannot_silently_shorten_real_control(tmp_path):
     from distillation.synthetic.experiments import initialize
     source=tmp_path/'references.pt'
     torch.save(dict(graphs=[None,None],ids=[1,2]),source)
-    comm=SimpleNamespace(rank=0,bcast=lambda value,root:value)
+    comm=SimpleNamespace(rank=0,bcast=lambda value,root:value,allgather=lambda value:[value])
     with pytest.raises(ValueError,match='reference file'):
         initialize(dict(reference_file=str(source),synthetic_count=4),tmp_path,comm)

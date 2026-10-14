@@ -51,7 +51,7 @@ def test_native_input_has_no_labels_and_sign_aware_bounds(record):
     assert not runner.duplicate(almost, [point], net, 1e-7)
 
 
-def test_template_reads_exact_train_id_and_checks_archive(tmp_path, record):
+def test_template_reads_exact_train_id_and_checks_archive(tmp_path, record, monkeypatch):
     case, index = 'pglib_opf_case30_ieee', 7
     graph = data.native_input(record['grid'])
     casefile = tmp_path / 'case.m'
@@ -74,6 +74,17 @@ def test_template_reads_exact_train_id_and_checks_archive(tmp_path, record):
     prepared, provenance = data.prepare_template(Dataset(), casefile, tmp_path)
     assert provenance['template_train_id'] == index
     assert 'objective' not in prepared
+    # Completed-library evaluations reuse the verified template without rescanning gzip.
+    def no_read(*args, **kwargs):
+        raise AssertionError('Repeated raw archive extraction')
+    with monkeypatch.context() as patch:
+        patch.setattr(data.tarfile, 'open', no_read)
+        again, origin = data.prepare_template(Dataset(), casefile, tmp_path)
+        torch.testing.assert_close(again['load'].x, prepared['load'].x)
+        assert origin == provenance
+        again['load'].x.zero_()
+        unchanged, _ = data.prepare_template(Dataset(), casefile, tmp_path)
+        torch.testing.assert_close(unchanged['load'].x, prepared['load'].x)
     Dataset.manifest['groups'][0]['raw_sha256'] = 'changed'
     with pytest.raises(ValueError, match='archive differs'):
         data.prepare_template(Dataset(), casefile, tmp_path)

@@ -84,7 +84,7 @@ def test_random_generation_returns_exact_sizes_and_independent_labels(random_dat
 @pytest.mark.parametrize("kind", ["GAT", "GIN", "HeteroGNN"])
 def test_random_mixed_size_grids_work_with_dd_and_all_three_models(graph, random_dataset, kind):
     from distillation.DD.campaign import model_for, model_options
-    from distillation.DD.demo import benchmark_batch
+    from distillation.synthetic.learning import benchmark_batch
     from distillation.DD.mvp import SyntheticOPF, gradient_summary, targets, unroll
 
     model = model_for(graph, dict(model=kind, model_options=model_options(kind, width=8)), 31, "cpu")

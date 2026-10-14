@@ -9,8 +9,8 @@ from distillation.DD.campaign import (
     Schedule, default_config, export, inner, optimizer_for, outer_loss, replay_export, restore,
     sampler_ids, score_summary, transplant,
 )
-from distillation.DD.demo import benchmark_graph
-from distillation.DD.replay_campaign import fit_schedule
+from distillation.synthetic.learning import benchmark_graph
+from distillation.DD.aux.replay_campaign import fit_schedule
 from distillation.DD.mvp import mse
 from distillation.test.test_dd_mvp import SmallRegressor
 from distillation.test import test_dd_demo as reference
@@ -93,7 +93,10 @@ def test_topology_rebase_retains_other_parameters_and_moments(graph):
             assert torch.count_nonzero(p) == 0
         else:
             torch.testing.assert_close(p, old[name], rtol=0, atol=0)
-            torch.testing.assert_close(opt.state[p]['exp_avg'], optimizer.state[old[name]]['exp_avg'], rtol=0, atol=0)
+            if p.requires_grad:
+                torch.testing.assert_close(opt.state[p]['exp_avg'], optimizer.state[old[name]]['exp_avg'], rtol=0, atol=0)
+            else:
+                assert p not in opt.state
 
 
 def test_inner_resets_model_and_does_not_modify_weights(graph):

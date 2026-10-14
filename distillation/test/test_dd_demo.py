@@ -12,7 +12,8 @@ import pytest
 import torch
 from threadpoolctl import threadpool_limits
 
-from distillation.DD import demo
+from distillation.DD import data
+from distillation.DD.aux import demo
 from distillation.conversion.matrix_form import equal_records, mat2opf, opf2mat
 from distillation.solver import ACOPF, PyPowerSolver, Solution, validate
 from lumina.dataset.opf.opf_dataset import build_heterodata_from_grid
@@ -67,7 +68,7 @@ def graph(record):
 
 
 def test_archive_sampling_matches_requested_split(tmp_path, monkeypatch, record):
-    monkeypatch.setattr(demo, "split_indices", lambda *args, **kwargs: {"test": np.array([1, 3, 8])})
+    monkeypatch.setattr(data, "split_indices", lambda *args, **kwargs: {"test": np.array([1, 3, 8])})
     case = "pglib_opf_case14_ieee"
     with tarfile.open(tmp_path / f"{case}_0.tar.gz", "w:gz") as archive:
         for index in range(9):
@@ -221,7 +222,7 @@ def test_unavailable_sparse_solver_keeps_reference_working(graph, monkeypatch):
 
 
 def test_notebook_structure():
-    notebook = json.loads((ROOT / "distillation/DD/demo_dd.ipynb").read_text())
+    notebook = json.loads((ROOT / "distillation/DD/aux/demo_dd.ipynb").read_text())
     assert notebook["nbformat"] == 4
     assert len(notebook["cells"]) <= 12
     for index, cell in enumerate(notebook["cells"]):

@@ -5,7 +5,7 @@ import pandas as pd
 import pytest
 import torch
 
-from distillation.DD.demo import benchmark_batch
+from distillation.synthetic.learning import benchmark_batch
 from distillation.DD.mvp import (
     SyntheticOPF, audit_networks, backtrack, gradient_summary, make_model, targets,
     unroll as unroll_core,

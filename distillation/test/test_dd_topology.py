@@ -5,9 +5,9 @@ import pandas as pd
 import pytest
 import torch
 
-from distillation.DD.demo import benchmark_batch
+from distillation.synthetic.learning import benchmark_batch
 from distillation.DD.mvp import SyntheticOPF, audit_networks, gradient_summary, make_model, mse, targets, unroll
-from distillation.DD.run_topology import outer_update
+from distillation.DD.aux.run_topology import outer_update
 from distillation.DD import topology
 from distillation.conversion.matrix_form import equal_records, mat2opf, opf2mat, validate_network
 from distillation.solver import ACOPF, Solution, validate
