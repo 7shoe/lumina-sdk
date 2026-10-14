@@ -1,0 +1,23 @@
+# Separate campaign: never prepare or refresh the Wave 1 synthesis root.
+schema_version: 1
+campaign: bas_controls_20261014
+output: /lus/flare/projects/FRAME-IDP/siebenschuh/acopf_datasets/dataset_selection
+data_root: /lus/flare/projects/FRAME-IDP/siebenschuh/acopf_datasets/processed/T1
+cases: [14, 30, 57, 118, 500]
+methods: [bas, uniform, demand_stratified]
+seed: 42
+export_seed: 4242
+counts: [100, 800]
+pool_size: 4096
+panel_size: 10240
+buckets: 30
+partition: quantile
+bas:
+  model: MLP
+  model_seed: 42
+  metric: ig
+  loss: l1
+  initial_size: 256
+  acquisition_size: 256
+  max_rounds: 500            # Finite ceiling; patience still determines acquisitions.
+  validation_size: 256      # Disjoint from Wave 1's following 1024 reporting examples.

@@ -45,3 +45,15 @@ Use the authoritative `CaseDataset.splits(42)`. Another random split with the sa
 - Exhausted buckets get no samples. Zero-score remainders are split equally among available buckets.
 
 All random decisions use a caller-owned NumPy RNG, independent of model/dropout RNG.
+
+## Portable experiments
+
+The separate [selection sidecar](../experiments/configs/selection.md) exports BAS,
+uniform and demand-stratified pools as nested M100/M800 datasets. `artifacts.publish`
+accepts a method-independent selection record and preserves original inputs/targets,
+IDs and provenance. `artifacts.load_dataset` reloads these without the source cache.
+Future selection policies can use this same exporter.
+
+`distillation.experiments.datasets.load_dataset` also reads existing synthetic
+exports and explicit dataset unions, without changing the Wave 1 implementation
+or reusing its model weights.
