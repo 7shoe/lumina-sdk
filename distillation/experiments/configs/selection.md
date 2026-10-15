@@ -98,5 +98,6 @@ not selection quality.
 
 Reports and verified case14 DD/DCGM M800 unions are stored in the sibling
 `dataset_selection/selection_support_20261014/` directory. Each union has 800
-distinct inputs and teaching pairs. The 15-condition campaign is prepared;
-the full selection runs have not been launched.
+distinct inputs and teaching pairs. The 15-condition campaign was submitted as
+PBS job 8929417; see the [campaign record](../documentation/selection_rambo_20261014.md)
+for output paths, monitoring and continuation policy.

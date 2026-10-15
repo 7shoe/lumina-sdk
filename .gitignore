@@ -21,6 +21,7 @@ distillation/synthetic/aux
 # - distillation
 distillation/DD/aux
 distillation/DC/aux
+distillation/HMDC/aux
 distillation/HDMC/aux
 
 # ignore verbose reports

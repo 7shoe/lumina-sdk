@@ -1,0 +1,30 @@
+#!/usr/bin/env bash
+#PBS -N opf-data
+#PBS -A EpiCalib
+#PBS -q debug
+#PBS -l select=1
+#PBS -l walltime=01:00:00
+#PBS -l filesystems=home:flare
+#PBS -j oe
+#PBS -m n
+set -euo pipefail
+ulimit -c 0
+data_started=$(date +%s)
+source /home/siebenschuh/Projects/reasonABLE/env/Aurora/activate_reason_venv.sh
+export OMP_NUM_THREADS=1 MKL_NUM_THREADS=1 OPENBLAS_NUM_THREADS=1 PYTHONUNBUFFERED=1 PYTHONDONTWRITEBYTECODE=1
+export ZE_FLAT_DEVICE_HIERARCHY=FLAT
+unset MPI4PY_RC_INITIALIZE RANK WORLD_SIZE LOCAL_RANK LOCAL_WORLD_SIZE MPI_LOCALRANKID SLURM_LOCALID PALS_LOCAL_RANKID STUDY_INPUT_MAP
+cd "${DATA_ROOT:?}/source"
+if [[ ${DATA_KIND:?} == rambo ]]; then
+    data_runtime="${TMPDIR:-/tmp}/lumina-rambo-${PBS_JOBID%%.*}"
+    mkdir -p "$data_runtime"
+    tar -xf "${RAMBO_RUNTIME_ARCHIVE:?}" -C "$data_runtime"
+    export RAMBO_JULIA="$data_runtime/julia-1.10.10/bin/julia"
+    export RAMBO_JULIA_DEPOT="$data_runtime/depot"
+    export JULIA_DEPOT_PATH="$RAMBO_JULIA_DEPOT" JULIA_NUM_THREADS=1
+    # Resolve/precompile once before ten independent workers read the local cache.
+    env LD_LIBRARY_PATH= "$RAMBO_JULIA" --startup-file=no \
+        --project="$DATA_ROOT/source/distillation/RAMBO/julia" \
+        -e 'using JuMP, Ipopt, PowerModels, JSON; println("Julia dependencies ready")'
+fi
+python -u "${DATA_LAUNCHER:?}" "$DATA_KIND" "$DATA_ROOT" --deadline "$((data_started+3300))"
