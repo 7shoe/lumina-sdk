@@ -1,0 +1,55 @@
+# Dataset paths are resolved by dataset_path.py. Prepare freezes exact IDs/indices.
+name: downstream_v1
+catalog: null  # repository distillation/experiments/configs/datasets.yaml
+paths:
+  data: /lus/flare/projects/FRAME-IDP/siebenschuh/acopf_datasets/processed/T1
+  corpora: /lus/flare/projects/FRAME-IDP/siebenschuh/acopf_datasets/downstream_experiments
+  models: /lus/flare/projects/FRAME-IDP/siebenschuh/acopf_models/downstream_experiments
+  t1: /lus/flare/projects/FRAME-IDP/siebenschuh/acopf_models/T1
+cases: [14, 30, 57, 118, 500]
+students: [GCN, GAT, GIN, Transformer, HGT, RGAT, HEAT, HeteroGNN]
+methods: [DD, DCGM, HMDC, BAS, RAMBO, US, DSS, RND777]
+seeds: [42, 43, 44]
+split_seed: 42
+subset_seed: 777
+pretrained_seed: 42
+source_cases: {14: 30, 30: 14, 57: 30, 118: 57, 500: 118}
+transfer_pairs: [[14, 30], [30, 14], [30, 57], [57, 118], [118, 500]]
+generation: conservative
+target_modes: [learned]  # add solver for separately identified physical-label controls
+creation_initializations: [random, pretrained]
+# Main M100 / 100-update synthesis schedule; exclude additional schedule ablations.
+# Every ambiguous creator/case/regime must have exactly one explicit choice.
+canonical_ids:
+  - DD-ece7cb1f2cc94fef
+  - DD-9176b2cd14375237
+  - DCGM-1b89d285533dc595
+  - DCGM-1b77f2c0e4c151ff
+  - HMDC-46d8b59cded5a426
+  - HMDC-45c193ae287ac008
+families:
+  individual: true
+  fixed: true
+  mixed_sizes: [100, 400]
+  adaptation_sizes: [100, 400]
+  joint_size: 400  # 200/source + 200/target; 0 disables joint/replay
+# T1 model definitions and AdamW defaults are imported by the trainer.
+model_options: {}
+optimizer: {lr: 0.001, weight_decay: 0.0001, eps: 0.00000001}
+training:
+  max_updates: 10000
+  batch_size: 25
+  eval_batch_size: 128
+  validation_updates: [100, 1000, 10000]
+  checkpoint_seconds: 300
+  log_updates: 100
+  gradient_clip: 1.0
+execution:
+  # T1 FLAT mapping: one worker per physical GPU, using its first visible tile.
+  # All visible tiles: [0,1,2,3,4,5,6,7,8,9,10,11].
+  devices: [0, 2, 4, 6, 8, 10]
+  stage_inputs: true
+  max_retries: 1
+  stall_seconds: 1200
+  minimum_attempt_seconds: 180
+  launch_interval: 0.2

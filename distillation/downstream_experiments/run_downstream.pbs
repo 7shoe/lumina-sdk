@@ -1,0 +1,21 @@
+#!/usr/bin/env bash
+#PBS -N lumina-downstream
+#PBS -A EpiCalib
+#PBS -q debug-scaling
+#PBS -l select=2
+#PBS -l walltime=01:00:00
+#PBS -l filesystems=home:flare
+#PBS -j oe
+set -euo pipefail
+repo=${DOWNSTREAM_REPO:-/home/siebenschuh/Projects/lumina-sdk}
+source "${DOWNSTREAM_ACTIVATE:-/home/siebenschuh/Projects/reasonABLE/env/Aurora/activate_reason_venv.sh}"
+cd "$repo"
+export OMP_NUM_THREADS=4 MKL_NUM_THREADS=4 PYTHONUNBUFFERED=1
+export ZE_FLAT_DEVICE_HIERARCHY=FLAT MPIR_CVAR_PROGRESS_TIMEOUT=0
+export DOWNSTREAM_STARTED=$(date +%s)
+unset MPI4PY_RC_INITIALIZE RANK WORLD_SIZE LOCAL_RANK MPI_LOCALRANKID SLURM_LOCALID PALS_LOCAL_RANKID
+: "${DOWNSTREAM_MANIFEST:?Prepare the campaign first; set DOWNSTREAM_MANIFEST to its manifest.json}"
+# One independent MPI launch per node; one student per configured XPU.
+# Re-submit this same manifest to continue training and partial test evaluation.
+python -u -m distillation.downstream_experiments.runtime launch \
+    --manifest "$DOWNSTREAM_MANIFEST" --seconds "${DOWNSTREAM_SECONDS:-3300}"

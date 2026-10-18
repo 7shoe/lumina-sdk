@@ -1,0 +1,17 @@
+#!/usr/bin/env bash
+#PBS -N downstream-isolation
+#PBS -A EpiCalib
+#PBS -q debug
+#PBS -l select=2
+#PBS -l walltime=01:00:00
+#PBS -l filesystems=home:flare
+#PBS -j oe
+set -euo pipefail
+source /home/siebenschuh/Projects/reasonABLE/env/Aurora/activate_reason_venv.sh
+cd /home/siebenschuh/Projects/lumina-sdk
+export OMP_NUM_THREADS=4 MKL_NUM_THREADS=4 PYTHONUNBUFFERED=1
+export ZE_FLAT_DEVICE_HIERARCHY=FLAT MPIR_CVAR_PROGRESS_TIMEOUT=0
+export DOWNSTREAM_STARTED=$(date +%s)
+unset MPI4PY_RC_INITIALIZE RANK WORLD_SIZE LOCAL_RANK MPI_LOCALRANKID SLURM_LOCALID PALS_LOCAL_RANKID
+python -u -m distillation.downstream_experiments.tests.isolation_xpu controller \
+    --name "${DOWNSTREAM_QUALIFICATION:-qualification_isolation_20261016}"
