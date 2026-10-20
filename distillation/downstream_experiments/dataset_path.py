@@ -24,7 +24,9 @@ ACRONYMS = dict(DD='DD',
                 BAS='BAS', 
                 RAMBO='RAMBO',
                 uniform='US',
-                demand_stratified='DSS')
+                demand_stratified='DSS',
+                input_target_herding='ITH', physics_herding='PIH', input_kcenter='KC',
+                demand_quantiles='DQS', learned_demand='LDM', analytical_labels='ALC')
 
 
 @lru_cache(maxsize=4)
@@ -97,7 +99,7 @@ def dataset_paths(**filters):
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('--catalog', type=Path, default=CATALOG)
-    parser.add_argument('--method', choices=('DD', 'DCGM', 'HMDC', 'BAS', 'RAMBO', 'US', 'DSS'), help='Distillation/condensation or selection technique')
+    parser.add_argument('--method', choices=tuple(ACRONYMS.values()), help='Distillation/condensation or selection technique')
     parser.add_argument('--model', help="Creator model/pair, MLP, or none; not the downstream student")
     parser.add_argument('--size', type=int, help='Published sample count; derived M400 mixtures have their own manifests')
     parser.add_argument('--case', choices=(14, 30, 57, 118, 500), type=int, help='Case size; supported 14, 30,..., 500')

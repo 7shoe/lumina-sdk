@@ -79,6 +79,8 @@ async def supervise(manifest, hosts, directory, deadline, *, command=mpi_command
     execution = manifest.get('specification', {}).get('execution', {})
     retries = execution.get('max_retries', 1)
     timeout = execution.get('stall_seconds', 1200)
+    shutdown_margin = execution.get('shutdown_margin_seconds', 30)
+    termination_grace = execution.get('termination_grace_seconds', 20)
     minimum = execution.get('minimum_attempt_seconds', 180)
     pending = deque((row, 0, None) for row in manifest['experiments'] if not complete(row))
     active, records, quarantined, owners = {}, {}, set(), {}
@@ -95,7 +97,7 @@ async def supervise(manifest, hosts, directory, deadline, *, command=mpi_command
         result = attempt_dir/'result.json'
         started = time.time()
         # Keep time for mpiexec cleanup before the supervisor's allocation deadline.
-        seconds = max(1, deadline-started-30)
+        seconds = max(1, deadline-started-shutdown_margin)
         env = {k:v for k,v in os.environ.items()
                if not k.startswith(('PMI', 'PMIX', 'OMPI_', 'PALS_'))
                and k not in {'RANK', 'WORLD_SIZE', 'LOCAL_RANK', 'MPI_LOCALRANKID', 'STUDY_INPUT_MAP'}}
@@ -119,31 +121,46 @@ async def supervise(manifest, hosts, directory, deadline, *, command=mpi_command
                 child = await asyncio.create_subprocess_exec(*argv, stdout=stream,
                     stderr=asyncio.subprocess.STDOUT, env=env, start_new_session=True)
                 wait = asyncio.create_task(child.wait())
-                while not wait.done():
+                previous, last_progress = None, time.monotonic()
+                while child.returncode is None:
                     # History records committed work and calibration/validation stages.
                     paths = [Path(row['output'])/name for name in
                              ('history.jsonl', 'latest.pt', 'status.json', 'evaluation.partial.json')]
-                    progress = max([started] + [p.stat().st_mtime for p in paths if p.exists()])
+                    # Observe changes locally: remote mtimes can be stale or clock-skewed.
+                    stamps = []
+                    for path in paths:
+                        try:
+                            stat = path.stat()
+                            stamps.append((path.name, stat.st_ino, stat.st_mtime_ns, stat.st_size,
+                                           path.read_text() if path.name == 'status.json' else None))
+                        except FileNotFoundError:
+                            pass
+                    if stamps != previous:
+                        previous, last_progress = stamps, time.monotonic()
                     if stop.is_set() or time.time() >= deadline-30:
                         record['status'] = 'INTERRUPTED'
-                        await terminate(child); break
-                    if timeout and time.time()-progress > timeout:
+                        await terminate(child, termination_grace); break
+                    if timeout and time.monotonic()-last_progress > timeout:
                         record['status'] = 'TIMED_OUT'
-                        await terminate(child); break
+                        record['watchdog'] = dict(idle_seconds=time.monotonic()-last_progress,
+                                                  observed_files=[s[0] for s in stamps],
+                                                  heartbeat=read_json(Path(row['output'])/'status.json', {}))
+                        await terminate(child, termination_grace); break
                     await asyncio.wait({wait}, timeout=poll_seconds)
                 code = await child.wait()
             record['returncode'] = code
             report = read_json(result, {})
             record['runner'] = report
-            if record['status'] == 'RUNNING':
+            if record['status'] in ('RUNNING', 'INTERRUPTED'):
                 record['status'] = ('COMPLETE' if code == 0 and complete(row) else
                                     'RESUMABLE' if code == 0 and report.get('status') in
-                                    ('RESUMABLE', 'FINALIZING') else 'FAILED')
+                                    ('RESUMABLE', 'FINALIZING') else
+                                    'INTERRUPTED' if record['status'] == 'INTERRUPTED' else 'FAILED')
         except Exception as exc:
             record.update(status='FAILED', error=f'{type(exc).__name__}: {exc}')
         finally:
             if child is not None and child.returncode is None:
-                await terminate(child)
+                await terminate(child, termination_grace)
             record['finished'] = time.time()
             write_json(attempt_dir/'status.json', record)
             write_json(Path(row['output'])/'launch_status.json', record)

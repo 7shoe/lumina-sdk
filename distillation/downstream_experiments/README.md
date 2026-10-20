@@ -1,5 +1,16 @@
 # Downstream training
 
+Results: [M100 comparison notebook](reports/m100_all_methods.ipynb) ·
+[PDF report](reports/m100_all_methods.pdf) ·
+[Colored tables](reports/m100_all_methods.html) · [Full-precision CSVs](reports/tables/).
+The report uses these fixed columns, in order: **DD, DCGM, HMDC, BAS, RAMBO,
+DSS, RND777, ITH, PIH, KC**. It includes MSE and physical-residual tables per
+case and win counts. HMDC keeps eligible pair results labelled inside one column;
+a model contributes at most one HMDC win. Excluded methods remain in the raw exports.
+
+[Prediction ensembles](ensemble/README.md) reuse the three saved student seeds
+on each M100 corpus and evaluate their averaged outputs without retraining.
+
 Train fresh or pretrained benchmark models on published DD, DCGM, HMDC, BAS,
 RAMBO, US and DSS datasets. `dataset_path.py` is the dataset feeder; `RND777`
 is a separate uniform subset of the complete OPFData **train** split. Source

@@ -38,6 +38,8 @@ def load_dataset(path):
         from distillation.selection.artifacts import load_dataset as reader
     elif metadata.get('format') == 'lumina-synthetic-dataset-v1':
         from distillation.synthetic.artifacts import load_dataset as reader
+    elif metadata.get('format') == 'lumina-curated-dataset-v1':
+        from distillation.curation.artifacts import load_dataset as reader
     else:
         raise ValueError('Unknown dataset artifact format')
     item = reader(path)
