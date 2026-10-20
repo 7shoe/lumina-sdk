@@ -1,0 +1,38 @@
+#!/usr/bin/env bash
+#PBS -N rambo-para
+#PBS -A EpiCalib
+#PBS -q debug-scaling
+#PBS -l select=1
+#PBS -l walltime=01:00:00
+#PBS -l filesystems=home:flare
+#PBS -j oe
+#PBS -m n
+set -euo pipefail
+ulimit -c 0
+rambo_started=$(date +%s)
+source /home/siebenschuh/Projects/reasonABLE/env/Aurora/activate_reason_venv.sh
+export OMP_NUM_THREADS=1 MKL_NUM_THREADS=1 OPENBLAS_NUM_THREADS=1 JULIA_NUM_THREADS=1
+export PYTHONUNBUFFERED=1 PYTHONDONTWRITEBYTECODE=1
+cd "${RAMBO_PARA_ROOT:?Set a prepared RAMBO_para campaign root}/source"
+if [[ $(sort -u "${PBS_NODEFILE:?}" | wc -l) -ne 1 ]]; then
+    echo "This launcher uses one node with many independent CPU solver workers." >&2
+    exit 1
+fi
+rambo_archive=$(python -m distillation.RAMBO_para.launch "$RAMBO_PARA_ROOT" --verify)
+rambo_runtime="${TMPDIR:-/tmp}/rambo-para-${PBS_JOBID%%.*}"
+mkdir -p "$rambo_runtime"
+tar -xf "$rambo_archive" -C "$rambo_runtime"
+export RAMBO_JULIA="$rambo_runtime/julia-1.10.10/bin/julia"
+export RAMBO_JULIA_DEPOT="$rambo_runtime/depot" JULIA_DEPOT_PATH="$rambo_runtime/depot"
+env LD_LIBRARY_PATH= "$RAMBO_JULIA" --startup-file=no --project=distillation/RAMBO/julia \
+    -e 'using JuMP, Ipopt, PowerModels, JSON; println("Julia dependencies ready")'
+rambo_remaining=$((rambo_started + 3300 - $(date +%s)))
+if ((rambo_remaining <= 0)); then
+    echo "Startup used the session budget; resubmit the same job." >&2
+    exit 1
+fi
+# One coordinator sees all cores; each Julia worker is pinned to a distinct physical core.
+mpiexec --pmi=pmix --envall -n 1 --ppn 1 --cpu-bind none \
+    python -u -m distillation.RAMBO_para.run "$RAMBO_PARA_ROOT/run" \
+    --config "$RAMBO_PARA_ROOT/requested_config.json" \
+    --workers "${RAMBO_PARA_WORKERS:-32}" --seconds "$rambo_remaining"
